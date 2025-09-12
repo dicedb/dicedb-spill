@@ -1,1 +1,20 @@
+# Build artifacts
 *.so
+*.o
+dicedb-infcache.so
+
+# Test artifacts
+test_unit
+.test_venv/
+__pycache__/
+*.pyc
+
+# RocksDB data directories
+dicedb-l2/
+*.rocksdb/
+
+# Temporary files
+*.tmp
+*.log
+
+test_unit

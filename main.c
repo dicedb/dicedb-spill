@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 
 static rocksdb_t *db = NULL;
 static rocksdb_options_t *options = NULL;
@@ -144,23 +145,54 @@ int PreevictionKeyNotification(ValkeyModuleCtx *ctx, int type, const char *event
         size_t keylen;
         const char *keyname = ValkeyModule_StringPtrLen(key, &keylen);
         
-        ValkeyModuleCallReply *reply = ValkeyModule_Call(ctx, "DUMP", "s", key);
+        ValkeyModuleCallReply *dump_reply = ValkeyModule_Call(ctx, "DUMP", "s", key);
+        ValkeyModuleCallReply *ttl_reply = ValkeyModule_Call(ctx, "PTTL", "s", key);
         
-        if (reply && ValkeyModule_CallReplyType(reply) == VALKEYMODULE_REPLY_STRING) {
-            size_t vallen;
-            const char *val = ValkeyModule_CallReplyStringPtr(reply, &vallen);
+        if (dump_reply && ValkeyModule_CallReplyType(dump_reply) == VALKEYMODULE_REPLY_STRING) {
+            size_t dump_len;
+            const char *dump_data = ValkeyModule_CallReplyStringPtr(dump_reply, &dump_len);
             
-            if (val && vallen > 0) {
-                char *err = NULL;
-                rocksdb_put(db, woptions, keyname, keylen, val, vallen, &err);
+            if (dump_data && dump_len > 0) {
+                long long pttl = -1;
+                if (ttl_reply && ValkeyModule_CallReplyType(ttl_reply) == VALKEYMODULE_REPLY_INTEGER) {
+                    pttl = ValkeyModule_CallReplyInteger(ttl_reply);
+                }
                 
-                if (err != NULL) {
-                    ValkeyModule_Log(ctx, "warning", "Failed to store key %.*s in RocksDB: %s", 
-                                   (int)keylen, keyname, err);
-                    free(err);
-                } else {
-                    ValkeyModule_Log(ctx, "notice", "Stored evicted key %.*s (%zu bytes) in RocksDB", 
-                                   (int)keylen, keyname, vallen);
+                int64_t absolute_expire_ms = 0;
+                if (pttl > 0) {
+                    struct timespec ts;
+                    clock_gettime(CLOCK_REALTIME, &ts);
+                    absolute_expire_ms = (int64_t)(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000 + pttl;
+                }
+                
+                size_t total_len = sizeof(int64_t) + sizeof(uint32_t) + dump_len;
+                char *combined_data = malloc(total_len);
+                
+                if (combined_data) {
+                    char *ptr = combined_data;
+                    
+                    memcpy(ptr, &absolute_expire_ms, sizeof(int64_t));
+                    ptr += sizeof(int64_t);
+                    
+                    uint32_t dump_len_32 = (uint32_t)dump_len;
+                    memcpy(ptr, &dump_len_32, sizeof(uint32_t));
+                    ptr += sizeof(uint32_t);
+                    
+                    memcpy(ptr, dump_data, dump_len);
+                    
+                    char *err = NULL;
+                    rocksdb_put(db, woptions, keyname, keylen, combined_data, total_len, &err);
+                    
+                    if (err != NULL) {
+                        ValkeyModule_Log(ctx, "warning", "Failed to store key %.*s in RocksDB: %s", 
+                                       (int)keylen, keyname, err);
+                        free(err);
+                    } else {
+                        ValkeyModule_Log(ctx, "notice", "Stored evicted key %.*s (%zu bytes, expire: %ld ms) in RocksDB", 
+                                       (int)keylen, keyname, dump_len, absolute_expire_ms);
+                    }
+                    
+                    free(combined_data);
                 }
             }
         } else {
@@ -168,12 +200,117 @@ int PreevictionKeyNotification(ValkeyModuleCtx *ctx, int type, const char *event
                            (int)keylen, keyname);
         }
         
-        if (reply) {
-            ValkeyModule_FreeCallReply(reply);
+        if (dump_reply) {
+            ValkeyModule_FreeCallReply(dump_reply);
+        }
+        if (ttl_reply) {
+            ValkeyModule_FreeCallReply(ttl_reply);
         }
     }
 
     return 0;
+}
+
+int RestoreCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    if (argc != 2) {
+        return ValkeyModule_WrongArity(ctx);
+    }
+    
+    if (!db) {
+        return ValkeyModule_ReplyWithError(ctx, "ERR RocksDB not initialized");
+    }
+    
+    size_t keylen;
+    const char *keyname = ValkeyModule_StringPtrLen(argv[1], &keylen);
+    
+    char *err = NULL;
+    size_t vallen;
+    char *val = rocksdb_get(db, roptions, keyname, keylen, &vallen, &err);
+    
+    if (err != NULL) {
+        ValkeyModule_ReplyWithError(ctx, err);
+        free(err);
+        return VALKEYMODULE_OK;
+    }
+    
+    if (val == NULL) {
+        return ValkeyModule_ReplyWithNull(ctx);
+    }
+    
+    if (vallen < sizeof(int64_t) + sizeof(uint32_t)) {
+        free(val);
+        return ValkeyModule_ReplyWithError(ctx, "ERR Corrupted data in RocksDB");
+    }
+    
+    char *ptr = val;
+    
+    int64_t absolute_expire_ms;
+    memcpy(&absolute_expire_ms, ptr, sizeof(int64_t));
+    ptr += sizeof(int64_t);
+    
+    uint32_t dump_len;
+    memcpy(&dump_len, ptr, sizeof(uint32_t));
+    ptr += sizeof(uint32_t);
+    
+    if (vallen != sizeof(int64_t) + sizeof(uint32_t) + dump_len) {
+        free(val);
+        return ValkeyModule_ReplyWithError(ctx, "ERR Data length mismatch in RocksDB");
+    }
+    
+    long long ttl_ms = 0;
+    if (absolute_expire_ms > 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        int64_t current_ms = (int64_t)(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+        ttl_ms = absolute_expire_ms - current_ms;
+        
+        if (ttl_ms <= 0) {
+            free(val);
+            
+            char *del_err = NULL;
+            rocksdb_delete(db, woptions, keyname, keylen, &del_err);
+            if (del_err) {
+                ValkeyModule_Log(ctx, "warning", "Failed to delete expired key from RocksDB: %s", del_err);
+                free(del_err);
+            }
+            
+            return ValkeyModule_ReplyWithError(ctx, "ERR Key has expired");
+        }
+    }
+    
+    ValkeyModuleString *dump_data = ValkeyModule_CreateString(ctx, ptr, dump_len);
+    
+    ValkeyModuleCallReply *reply;
+    if (ttl_ms > 0) {
+        char ttl_str[32];
+        snprintf(ttl_str, sizeof(ttl_str), "%lld", ttl_ms);
+        reply = ValkeyModule_Call(ctx, "RESTORE", "sslc", argv[1], ttl_str, dump_data, "!");
+    } else {
+        reply = ValkeyModule_Call(ctx, "RESTORE", "sslc", argv[1], "0", dump_data, "!");
+    }
+    
+    free(val);
+    ValkeyModule_FreeString(ctx, dump_data);
+    
+    if (reply && ValkeyModule_CallReplyType(reply) == VALKEYMODULE_REPLY_ERROR) {
+        const char *errmsg = ValkeyModule_CallReplyStringPtr(reply, NULL);
+        ValkeyModule_ReplyWithError(ctx, errmsg);
+    } else {
+        ValkeyModule_ReplyWithSimpleString(ctx, "OK");
+        
+        char *del_err = NULL;
+        rocksdb_delete(db, woptions, keyname, keylen, &del_err);
+        if (del_err) {
+            ValkeyModule_Log(ctx, "warning", "Failed to delete key from RocksDB after restore: %s", del_err);
+            free(del_err);
+        }
+    }
+    
+    if (reply) {
+        ValkeyModule_FreeCallReply(reply);
+    }
+    
+    return VALKEYMODULE_OK;
 }
 
 int InfoCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
@@ -210,6 +347,11 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
     
     if (ValkeyModule_SubscribeToKeyspaceEvents(ctx, VALKEYMODULE_NOTIFY_PREEVICTION, PreevictionKeyNotification) != VALKEYMODULE_OK) {
         ValkeyModule_Log(ctx, "warning", "Failed to subscribe to eviction events");
+        CleanupRocksDB();
+        return VALKEYMODULE_ERR;
+    }
+    
+    if (ValkeyModule_CreateCommand(ctx, "infcache.restore", RestoreCommand, "write", 1, 1, 1) == VALKEYMODULE_ERR) {
         CleanupRocksDB();
         return VALKEYMODULE_ERR;
     }
