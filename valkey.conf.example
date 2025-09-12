@@ -1,0 +1,39 @@
+# Valkey/DiceDB Configuration Example for Infcache Module
+# 
+# This example shows how to load the infcache module with various RocksDB configuration parameters.
+# Add these lines to your valkey.conf or dicedb.conf file.
+
+# Basic module loading with default settings
+# loadmodule /path/to/dicedb-infcache.so
+
+# Full configuration example with all available parameters:
+loadmodule /path/to/dicedb-infcache.so \
+    path ./dicedb-l2 \
+    create_if_missing 1 \
+    error_if_exists 0 \
+    paranoid_checks 0 \
+    compression 1 \
+    write_buffer_size 67108864 \
+    max_open_files 1000 \
+    block_size 4096 \
+    block_restart_interval 16 \
+    max_file_size 67108864
+
+# Configuration Parameters Explained:
+#
+# path <string>                 - RocksDB database directory path (default: /var/lib/infcache)
+# create_if_missing <0|1>       - Create DB if it doesn't exist (default: 1)
+# error_if_exists <0|1>         - Error if DB already exists (default: 0)
+# paranoid_checks <0|1>         - Enable paranoid checks (default: 0)
+# compression <0|1>             - Enable Snappy compression (default: 1, 0=no compression)
+# write_buffer_size <bytes>     - Size of write buffer (default: 64MB)
+# max_open_files <number>       - Maximum number of open files (default: 1000)
+# block_size <bytes>            - Block size for SST files (default: 4KB)
+# block_restart_interval <num>  - Number of keys between restart points (default: 16)
+# max_file_size <bytes>         - Target file size for SST files (default: 64MB)
+
+# To test the module after loading:
+# 1. Set some keys in Valkey/DiceDB
+# 2. Trigger eviction (e.g., by setting maxmemory and adding more data)
+# 3. Use infcache.restore <key> to restore evicted keys from RocksDB
+# 4. Use infcache.info to view RocksDB statistics

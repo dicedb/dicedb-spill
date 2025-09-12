@@ -1,6 +1,7 @@
 CC = gcc
 CFLAGS = -fPIC -std=gnu99 -Wall -Wextra -O2
-LDFLAGS = -shared
+LDFLAGS = -shared -lrocksdb -lstdc++ -lpthread -ldl
+INCLUDES = -I/usr/local/include
 
 MODULE = dicedb-infcache.so
 SOURCE = main.c
@@ -8,7 +9,7 @@ SOURCE = main.c
 all: $(MODULE)
 
 $(MODULE): $(SOURCE)
-	$(CC) $(CFLAGS) $(LDFLAGS) -I/home/arpit/workspace/dicedb/dice2/src -o $@ $<
+	$(CC) $(CFLAGS) $(INCLUDES) -I/home/arpit/workspace/dicedb/dice2/src -o $@ $< $(LDFLAGS)
 
 clean:
 	rm -f $(MODULE)
