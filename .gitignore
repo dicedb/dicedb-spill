@@ -18,3 +18,4 @@ dicedb-l2/
 *.log
 
 test_unit
+venv

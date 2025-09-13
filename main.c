@@ -70,7 +70,7 @@ void ParseModuleArgs(ValkeyModuleString **argv, int argc) {
     }
     
     if (!config.db_path) {
-        config.db_path = strdup("./dicedb-l2");
+        config.db_path = strdup("/tmp/dicedb-l2");
     }
 }
 
@@ -136,6 +136,106 @@ void CleanupRocksDB() {
         free(config.db_path);
         config.db_path = NULL;
     }
+}
+
+int PremissNotification(ValkeyModuleCtx *ctx, int type, const char *event, ValkeyModuleString *key) {
+    VALKEYMODULE_NOT_USED(type);
+    if (strcmp(event, "premiss") == 0 && db != NULL) {
+        size_t keylen;
+        const char *keyname = ValkeyModule_StringPtrLen(key, &keylen);
+
+        char *err = NULL;
+        size_t vallen;
+        char *val = rocksdb_get(db, roptions, keyname, keylen, &vallen, &err);
+
+        if (err != NULL) {
+            ValkeyModule_Log(ctx, "debug", "Failed to get key %.*s from RocksDB: %s",
+                           (int)keylen, keyname, err);
+            free(err);
+            return 0;
+        }
+
+        if (val == NULL) {
+            return 0;
+        }
+
+        if (vallen < sizeof(int64_t) + sizeof(uint32_t)) {
+            free(val);
+            ValkeyModule_Log(ctx, "warning", "Corrupted data for key %.*s in RocksDB",
+                           (int)keylen, keyname);
+            return 0;
+        }
+
+        char *ptr = val;
+
+        int64_t absolute_expire_ms;
+        memcpy(&absolute_expire_ms, ptr, sizeof(int64_t));
+        ptr += sizeof(int64_t);
+
+        uint32_t dump_len;
+        memcpy(&dump_len, ptr, sizeof(uint32_t));
+        ptr += sizeof(uint32_t);
+
+        if (vallen != sizeof(int64_t) + sizeof(uint32_t) + dump_len) {
+            free(val);
+            ValkeyModule_Log(ctx, "warning", "Data length mismatch for key %.*s in RocksDB",
+                           (int)keylen, keyname);
+            return 0;
+        }
+
+        if (absolute_expire_ms > 0) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            int64_t current_ms = (int64_t)(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+
+            if (absolute_expire_ms <= current_ms) {
+                free(val);
+
+                char *del_err = NULL;
+                rocksdb_delete(db, woptions, keyname, keylen, &del_err);
+                if (del_err) {
+                    ValkeyModule_Log(ctx, "debug", "Failed to delete expired key from RocksDB: %s", del_err);
+                    free(del_err);
+                }
+
+                return 0;
+            }
+        }
+
+        ValkeyModuleString *dump_data = ValkeyModule_CreateString(ctx, ptr, dump_len);
+
+        ValkeyModuleCallReply *reply;
+        if (absolute_expire_ms > 0) {
+            reply = ValkeyModule_Call(ctx, "RESTORE", "slscc", key, absolute_expire_ms/1000, dump_data, "REPLACE", "ABSTTL");
+        } else {
+            reply = ValkeyModule_Call(ctx, "RESTORE", "slsc", key, 0, dump_data, "REPLACE");
+        }
+
+        free(val);
+        ValkeyModule_FreeString(ctx, dump_data);
+
+        if (reply && ValkeyModule_CallReplyType(reply) == VALKEYMODULE_REPLY_ERROR) {
+            const char *errmsg = ValkeyModule_CallReplyStringPtr(reply, NULL);
+            ValkeyModule_Log(ctx, "warning", "Failed to restore key %.*s from RocksDB: %s",
+                           (int)keylen, keyname, errmsg);
+        } else {
+            ValkeyModule_Log(ctx, "notice", "Automatically restored key %.*s from RocksDB (ABSTTL: %lld ms)",
+                           (int)keylen, keyname, absolute_expire_ms);
+
+            char *del_err = NULL;
+            rocksdb_delete(db, woptions, keyname, keylen, &del_err);
+            if (del_err) {
+                ValkeyModule_Log(ctx, "warning", "Failed to delete key from RocksDB after restore: %s", del_err);
+                free(del_err);
+            }
+        }
+
+        if (reply) {
+            ValkeyModule_FreeCallReply(reply);
+        }
+    }
+
+    return 0;
 }
 
 int PreevictionKeyNotification(ValkeyModuleCtx *ctx, int type, const char *event, ValkeyModuleString *key) {
@@ -347,6 +447,12 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
     
     if (ValkeyModule_SubscribeToKeyspaceEvents(ctx, VALKEYMODULE_NOTIFY_PREEVICTION, PreevictionKeyNotification) != VALKEYMODULE_OK) {
         ValkeyModule_Log(ctx, "warning", "Failed to subscribe to eviction events");
+        CleanupRocksDB();
+        return VALKEYMODULE_ERR;
+    }
+
+    if (ValkeyModule_SubscribeToKeyspaceEvents(ctx, VALKEYMODULE_NOTIFY_PREMISS, PremissNotification) != VALKEYMODULE_OK) {
+        ValkeyModule_Log(ctx, "warning", "Failed to subscribe to premiss events");
         CleanupRocksDB();
         return VALKEYMODULE_ERR;
     }

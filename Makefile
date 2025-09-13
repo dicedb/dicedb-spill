@@ -18,18 +18,7 @@ clean:
 install: $(MODULE)
 	cp $(MODULE) /usr/local/lib/
 
-test: test-unit test-integration
-
-test-unit: test_unit
-	./test_unit
-
-test-integration: $(MODULE)
-	./run_integration_tests.sh
-
-test_unit: test_unit.c
-	gcc -std=c99 -o test_unit test_unit.c -DNDEBUG
-
-test-all: $(MODULE)
+test: $(MODULE)
 	./run_tests.sh
 
-.PHONY: all clean install test test-unit test-integration test-all
+.PHONY: all clean install test
