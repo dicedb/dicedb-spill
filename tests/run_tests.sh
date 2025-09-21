@@ -19,7 +19,7 @@ NC='\033[0m' # No Color
 UNIT_TEST_BINARY="test_unit"
 INTEGRATION_TEST_SCRIPT="test_integration.py"
 EDGE_CASE_TEST_SCRIPT="test_edge_cases.py"
-MODULE_BINARY="dicedb-infcache.so"
+MODULE_BINARY="../lib-infcache.so"
 
 echo "================================================="
 echo "  DiceDB Infcache Comprehensive Test Suite"
@@ -98,14 +98,14 @@ run_unit_tests() {
 run_integration_tests() {
     print_status "INFO" "=== RUNNING INTEGRATION TESTS ==="
     print_status "INFO" "Running integration tests with ABSTTL functionality..."
-    print_status "WARNING" "Note: Integration tests require DiceDB server running on port 6379 with infcache module"
+    print_status "WARNING" "Note: Integration tests require DiceDB server running on port 8379 with infcache module"
 
     if ./run_integration_tests.sh; then
         print_status "SUCCESS" "Integration tests passed (16 tests including ABSTTL tests)"
         return 0
     else
         print_status "ERROR" "Integration tests failed"
-        print_status "INFO" "Make sure DiceDB server is running: dicedb-server --port 6379 --loadmodule ./dicedb-infcache.so"
+        print_status "INFO" "Make sure DiceDB server is running: dicedb-server --port 8379 --loadmodule ./lib-infcache.so"
         return 1
     fi
 }
@@ -153,7 +153,7 @@ import time
 import sys
 
 try:
-    r = redis.Redis(host='localhost', port=6379, decode_responses=True)
+    r = redis.Redis(host='localhost', port=8379, decode_responses=True)
     r.ping()
 
     print("  Testing ABSTTL restoration performance...")

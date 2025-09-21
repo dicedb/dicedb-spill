@@ -1,7 +1,6 @@
 # Build artifacts
 *.so
 *.o
-dicedb-infcache.so
 
 # Test artifacts
 test_unit

@@ -4,10 +4,10 @@
 # Add these lines to your valkey.conf or dicedb.conf file.
 
 # Basic module loading with default settings
-# loadmodule /path/to/dicedb-infcache.so
+# loadmodule /path/to/lib-infcache.so
 
 # Full configuration example with all available parameters:
-loadmodule /path/to/dicedb-infcache.so \
+loadmodule /path/to/lib-infcache.so \
     path ./dicedb-l2 \
     create_if_missing 1 \
     error_if_exists 0 \

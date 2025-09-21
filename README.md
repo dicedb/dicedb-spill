@@ -1,25 +1,21 @@
-# DiceDB - Infinite Cache with RocksDB
+# DiceDB - Infinite Cache
 
-This Valkey/DiceDB module automatically backs up evicted keys to RocksDB before they are removed from memory, providing an infinite cache capability with full TTL support.
+This DiceDB module automatically backs up evicted keys to SSD based storage (eg: RocksDB) before they are removed from memory, providing an infinite cache capability with full TTL support.
 
 ## Features
 
-- **Automatic Backup**: Captures keys using DUMP command before eviction
-- **TTL Preservation**: Stores and restores key expiration times accurately
-- **RocksDB Storage**: Persistent storage with configurable compression and performance settings
-- **Compact Format**: Efficient storage format combining serialized data with expiration metadata
-- **Auto-expiration**: Keys that have expired are automatically removed during restore attempts
+- Automatic Backup: Captures keys using DUMP command before eviction
+- TTL Preservation: Stores and restores key expiration times accurately
+- RocksDB Storage: Persistent storage with configurable compression and performance settings
+- Compact Format: Efficient storage format combining serialized data with expiration metadata
+- Auto-expiration: Keys that have expired are automatically removed during restore attempts
 
 ## Prerequisites
 
-Install RocksDB development libraries:
+Install RocksDB development libraries
 
 ```bash
-# Ubuntu/Debian
-sudo apt-get install librocksdb-dev
-
-# Or build from source using the provided script
-./install_rocksdb.sh
+$ bash scripts/install_rocksdb.sh
 ```
 
 ## Building the Module
@@ -31,7 +27,7 @@ sudo apt-get install librocksdb-dev
 make
 ```
 
-This will create `dicedb-infcache.so` shared library file.
+This will create `lib-infcache.so` shared library file.
 
 ## Loading the Module
 
@@ -39,11 +35,11 @@ Start DiceDB server with the module:
 
 ```bash
 # Basic loading with default settings
-dicedb-server --loadmodule /path/to/dicedb-infcache.so
+dicedb-server --loadmodule /path/to/lib-infcache.so
 
 # With custom configuration
-dicedb-server --loadmodule /path/to/dicedb-infcache.so \
-    path ./dicedb-l2 \
+dicedb-server --loadmodule /path/to/lib-infcache.so \
+    path /tmp/dicedb-l2 \
     compression 1 \
     write_buffer_size 67108864
 ```
@@ -85,25 +81,6 @@ Display RocksDB statistics and performance metrics.
 infcache.info
 ```
 
-## Data Storage Format
-
-The module stores data in a compact binary format:
-- **8 bytes**: Absolute expiration timestamp in milliseconds (0 if no expiration)
-- **4 bytes**: Length of DUMP data
-- **N bytes**: Serialized key-value data from DUMP command
-
-## How It Works
-
-1. **Pre-eviction Hook**: When a key is about to be evicted, the module intercepts the event
-2. **Capture Data**: Executes `DUMP` to serialize the key and `PTTL` to get remaining TTL
-3. **Calculate Expiration**: Converts relative TTL to absolute timestamp
-4. **Store in RocksDB**: Saves combined data (expiration + dump) to RocksDB
-5. **Restoration**: When `infcache.restore` is called:
-   - Retrieves data from RocksDB
-   - Checks if key has expired
-   - Uses `RESTORE` with calculated TTL to recreate the key
-   - Removes from RocksDB after successful restore
-
 ## Testing
 
 1. Set memory limits to trigger eviction:
@@ -131,36 +108,21 @@ The module stores data in a compact binary format:
 
 ## Performance Considerations
 
-- **Eviction Overhead**: Each eviction requires DUMP + PTTL + RocksDB write
-- **Storage Efficiency**: Compression reduces disk usage, TTL adds only 12 bytes overhead
-- **Expired Keys**: Automatically cleaned up on restore attempt
-- **Memory vs Disk**: Trade memory for unlimited disk-based storage
+- Eviction Overhead: Each eviction requires DUMP + PTTL + RocksDB write
+- Storage Efficiency: Compression reduces disk usage, TTL adds only 12 bytes overhead
+- Expired Keys: Automatically cleaned up on restore attempt
+- Memory vs Disk: Trade memory for unlimited disk-based storage
 
 ## Testing
 
 Run unit tests:
-```bash
-make test-unit
-```
 
-Run integration tests (requires DiceDB server running on port 6379 with module loaded):
 ```bash
-# First start DiceDB with the module
-dicedb-server --port 6379 --loadmodule ./dicedb-infcache.so
-
-# Then run tests (automatically sets up venv with valkey client)
-make test-integration
-```
-
-Run all tests:
-```bash
-make test-all
-# or
-./run_tests.sh
+$ dicedb-server --port 8379 --loadmodule ./lib-infcache.so
+$ make test
 ```
 
 ## Limitations
 
-- Only captures keys evicted due to memory pressure (not DEL commands)
 - DUMP/RESTORE may not support all Redis module data types
 - Requires clock synchronization for accurate TTL preservation across restarts
