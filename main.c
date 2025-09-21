@@ -219,7 +219,7 @@ int PremissNotification(ValkeyModuleCtx *ctx, int type, const char *event, Valke
             ValkeyModule_Log(ctx, "warning", "Failed to restore key %.*s from RocksDB: %s",
                            (int)keylen, keyname, errmsg);
         } else {
-            ValkeyModule_Log(ctx, "notice", "Automatically restored key %.*s from RocksDB (ABSTTL: %lld ms)",
+            ValkeyModule_Log(ctx, "notice", "Automatically restored key %.*s from RocksDB (ABSTTL: %ld ms)",
                            (int)keylen, keyname, absolute_expire_ms);
 
             char *del_err = NULL;
