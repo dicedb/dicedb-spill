@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 199309L
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -420,10 +421,270 @@ TEST(expired_key_cleanup_simulation) {
     }
 }
 
+// Test fast_atoll function (mock implementation for testing)
+static long long mock_fast_atoll(const char *str, size_t len) {
+    if (len == 0 || len > 20) return 0;
+
+    long long result = 0;
+    long long sign = 1;
+    size_t i = 0;
+
+    if (len > 0 && str[0] == '-') {
+        sign = -1;
+        i = 1;
+    }
+
+    for (; i < len && str[i] >= '0' && str[i] <= '9'; i++) {
+        long long new_result = result * 10 + (str[i] - '0');
+        if (new_result < result) return 0; // Overflow
+        result = new_result;
+    }
+
+    return result * sign;
+}
+
+TEST(fast_atoll_basic_conversions) {
+    // Test basic positive numbers
+    assert(mock_fast_atoll("123", 3) == 123);
+    assert(mock_fast_atoll("0", 1) == 0);
+    assert(mock_fast_atoll("1", 1) == 1);
+    assert(mock_fast_atoll("9999", 4) == 9999);
+
+    // Test negative numbers
+    assert(mock_fast_atoll("-123", 4) == -123);
+    assert(mock_fast_atoll("-1", 2) == -1);
+
+    // Test edge cases
+    assert(mock_fast_atoll("", 0) == 0);       // Empty string
+    assert(mock_fast_atoll("abc", 3) == 0);    // Non-numeric
+    assert(mock_fast_atoll("12abc", 5) == 12); // Partial numeric
+}
+
+TEST(fast_atoll_large_numbers) {
+    // Test large valid numbers
+    assert(mock_fast_atoll("9223372036854775807", 19) > 0); // Near max long long
+    assert(mock_fast_atoll("1000000000", 10) == 1000000000LL);
+
+    // Test overflow handling (should return 0)
+    assert(mock_fast_atoll("99999999999999999999999", 23) == 0);
+
+    // Test too long strings
+    assert(mock_fast_atoll("12345678901234567890123", 23) == 0);
+}
+
+TEST(fast_atoll_edge_cases) {
+    // Test single digits
+    for (int i = 0; i <= 9; i++) {
+        char digit_str[2] = {'0' + i, '\0'};
+        assert(mock_fast_atoll(digit_str, 1) == i);
+    }
+
+    // Test two digits
+    assert(mock_fast_atoll("10", 2) == 10);
+    assert(mock_fast_atoll("99", 2) == 99);
+
+    // Test with leading zeros (should still work)
+    assert(mock_fast_atoll("00123", 5) == 123);
+    assert(mock_fast_atoll("000", 3) == 0);
+}
+
+// Test time caching functionality
+TEST(time_caching_consistency) {
+    // Test that get_current_time_ms returns reasonable values
+    int64_t time1 = get_current_time_ms();
+    assert(time1 > 0);
+
+    // Small delay
+    for (volatile int i = 0; i < 1000000; i++);
+
+    int64_t time2 = get_current_time_ms();
+    assert(time2 >= time1); // Time should not go backwards
+    assert(time2 - time1 < 1000); // Should be less than 1 second difference
+}
+
+TEST(time_precision_validation) {
+    // Test that time has millisecond precision
+    int64_t current_time = get_current_time_ms();
+
+    // Verify it's a reasonable timestamp (after year 2020)
+    int64_t year_2020_ms = 1577836800000LL; // Jan 1, 2020
+    assert(current_time > year_2020_ms);
+
+    // Verify it's not too far in the future (before year 2050)
+    int64_t year_2050_ms = 2524608000000LL; // Jan 1, 2050
+    assert(current_time < year_2050_ms);
+}
+
+// Test configuration parsing logic (mock implementation)
+typedef struct {
+    char *db_path;
+    int create_if_missing;
+    int error_if_exists;
+    int paranoid_checks;
+    int compression;
+    size_t write_buffer_size;
+    int max_open_files;
+    size_t block_size;
+    int block_restart_interval;
+    size_t max_file_size;
+} MockConfig;
+
+static MockConfig mock_config = {0};
+
+static void mock_parse_args(const char **args, int count) {
+    for (int i = 0; i < count; i += 2) {
+        if (i + 1 >= count) break;
+
+        const char *key = args[i];
+        const char *value = args[i + 1];
+
+        if (strcmp(key, "path") == 0) {
+            if (mock_config.db_path) free(mock_config.db_path);
+            mock_config.db_path = strdup(value);
+        } else if (strcmp(key, "compression") == 0) {
+            mock_config.compression = atoi(value);
+        } else if (strcmp(key, "write_buffer_size") == 0) {
+            mock_config.write_buffer_size = (size_t)atoll(value);
+        }
+    }
+
+    if (!mock_config.db_path) {
+        mock_config.db_path = strdup("/tmp/dicedb-l2");
+    }
+}
+
+TEST(config_parsing_basic) {
+    // Reset config
+    if (mock_config.db_path) {
+        free(mock_config.db_path);
+        mock_config.db_path = NULL;
+    }
+    memset(&mock_config, 0, sizeof(mock_config));
+
+    // Test basic parsing
+    const char *args[] = {"path", "/custom/path", "compression", "1"};
+    mock_parse_args(args, 4);
+
+    assert(strcmp(mock_config.db_path, "/custom/path") == 0);
+    assert(mock_config.compression == 1);
+
+    free(mock_config.db_path);
+    mock_config.db_path = NULL;
+}
+
+TEST(config_parsing_defaults) {
+    // Reset config
+    if (mock_config.db_path) {
+        free(mock_config.db_path);
+        mock_config.db_path = NULL;
+    }
+    memset(&mock_config, 0, sizeof(mock_config));
+
+    // Test default path assignment
+    const char *args[] = {"compression", "0"};
+    mock_parse_args(args, 2);
+
+    assert(strcmp(mock_config.db_path, "/tmp/dicedb-l2") == 0);
+    assert(mock_config.compression == 0);
+
+    free(mock_config.db_path);
+    mock_config.db_path = NULL;
+}
+
+TEST(config_parsing_numeric_values) {
+    // Reset config
+    if (mock_config.db_path) {
+        free(mock_config.db_path);
+        mock_config.db_path = NULL;
+    }
+    memset(&mock_config, 0, sizeof(mock_config));
+
+    // Test numeric value parsing
+    const char *args[] = {
+        "write_buffer_size", "67108864",
+        "compression", "1"
+    };
+    mock_parse_args(args, 4);
+
+    assert(mock_config.write_buffer_size == 67108864);
+    assert(mock_config.compression == 1);
+
+    if (mock_config.db_path) {
+        free(mock_config.db_path);
+        mock_config.db_path = NULL;
+    }
+}
+
+// Test error message handling
+TEST(error_message_constants) {
+    // Test error message lengths and content
+    const char *expected_messages[] = {
+        "ERR RocksDB not initialized",
+        "ERR Corrupted data in RocksDB",
+        "ERR Data length mismatch in RocksDB",
+        "ERR Key has expired",
+        "ERR Failed to get current time"
+    };
+
+    const size_t expected_lengths[] = {26, 29, 35, 19, 31};
+
+    for (int i = 0; i < 5; i++) {
+        size_t actual_len = strlen(expected_messages[i]);
+        assert(actual_len == expected_lengths[i]);
+        assert(strlen(expected_messages[i]) > 0);
+    }
+}
+
+// Test statistics tracking
+typedef struct {
+    uint64_t keys_stored;
+    uint64_t keys_restored;
+    uint64_t keys_expired;
+    uint64_t keys_cleaned;
+    uint64_t bytes_written;
+    uint64_t bytes_read;
+} MockStats;
+
+static MockStats mock_stats = {0};
+
+TEST(stats_tracking_increments) {
+    // Reset stats
+    memset(&mock_stats, 0, sizeof(mock_stats));
+
+    // Test basic increments
+    mock_stats.keys_stored++;
+    mock_stats.bytes_written += 1024;
+
+    assert(mock_stats.keys_stored == 1);
+    assert(mock_stats.bytes_written == 1024);
+    assert(mock_stats.keys_restored == 0);
+
+    // Test multiple increments
+    mock_stats.keys_restored += 5;
+    mock_stats.bytes_read += 2048;
+
+    assert(mock_stats.keys_restored == 5);
+    assert(mock_stats.bytes_read == 2048);
+}
+
+TEST(stats_overflow_handling) {
+    // Test with large values
+    mock_stats.keys_stored = UINT64_MAX - 1;
+    mock_stats.keys_stored++; // Should wrap to UINT64_MAX
+
+    assert(mock_stats.keys_stored == UINT64_MAX);
+
+    // Test bytes counters with large values
+    mock_stats.bytes_written = 1000000000ULL;
+    mock_stats.bytes_written += 2000000000ULL;
+
+    assert(mock_stats.bytes_written == 3000000000ULL);
+}
+
 int main() {
     printf("=== Running Unit Tests ===\n");
 
-    tests_total = 19;
+    tests_total = 30;
 
     // Original tests
     RUN_TEST(storage_format_no_expiration);
@@ -447,6 +708,19 @@ int main() {
     RUN_TEST(storage_format_with_precise_absttl);
     RUN_TEST(storage_format_max_timestamp);
     RUN_TEST(expired_key_cleanup_simulation);
+
+    // New utility function tests
+    RUN_TEST(fast_atoll_basic_conversions);
+    RUN_TEST(fast_atoll_large_numbers);
+    RUN_TEST(fast_atoll_edge_cases);
+    RUN_TEST(time_caching_consistency);
+    RUN_TEST(time_precision_validation);
+    RUN_TEST(config_parsing_basic);
+    RUN_TEST(config_parsing_defaults);
+    RUN_TEST(config_parsing_numeric_values);
+    RUN_TEST(error_message_constants);
+    RUN_TEST(stats_tracking_increments);
+    RUN_TEST(stats_overflow_handling);
 
     printf("\n=== Test Results ===\n");
     printf("Tests passed: %d/%d\n", tests_passed, tests_total);

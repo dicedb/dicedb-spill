@@ -1,24 +1,30 @@
-CC = gcc
-CFLAGS = -fPIC -std=gnu99 -Wall -Wextra -O2
-LDFLAGS = -shared -lrocksdb -lstdc++ -lpthread -ldl
+SHOBJ_CFLAGS ?= -W -Wall -fno-common -g -ggdb3 -std=gnu99 -O2
+SHOBJ_LDFLAGS ?= -shared
+
+MODULE_NAME = lib-infcache
+MODULE_SO = $(MODULE_NAME).so
+MODULE_H_DIR = /home/arpit/workspace/dicedb/dice2/src
+
 INCLUDES = -I/usr/local/include
+LIBS = -lrocksdb -lstdc++ -lpthread -ldl
 
-MODULE = lib-infcache.so
-SOURCE = main.c
+.SUFFIXES:
+.PHONY: all clean test
 
-all: $(MODULE)
+all: $(MODULE_SO)
 
-$(MODULE): $(SOURCE)
-	$(CC) $(CFLAGS) $(INCLUDES) -I/home/arpit/workspace/dicedb/dice2/src -o $@ $< $(LDFLAGS)
+SOURCES = infcache.c
+OBJECTS = $(SOURCES:.c=.o)
+
+$(MODULE_SO): $(OBJECTS)
+	$(CC) -I. $(CFLAGS) $(SHOBJ_CFLAGS) -I$(MODULE_H_DIR) $(INCLUDES) -fPIC -o $@ $^ $(SHOBJ_LDFLAGS) $(LIBS) -lc
+
+%.o: %.c
+	$(CC) -I. $(CFLAGS) $(SHOBJ_CFLAGS) -I$(MODULE_H_DIR) $(INCLUDES) -fPIC -c $< -o $@
 
 clean:
-	rm -f $(MODULE) test_unit
+	rm -f $(MODULE_SO) $(OBJECTS) test_unit
 	rm -rf .test_venv __pycache__ *.pyc
 
-install: $(MODULE)
-	cp $(MODULE) /usr/local/lib/
-
-test: $(MODULE)
+test:
 	cd tests && ./run_tests.sh
-
-.PHONY: all clean install test

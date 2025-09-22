@@ -25,17 +25,16 @@ except ImportError:
 REDIS_PORT = 8379
 
 def run_test(test_func, test_name):
-    """Run a single test and report results"""
     try:
-        print(f"\nRunning: {test_name}...", end=" ")
+        print(f"{test_name}...", end=" ")
         test_func()
-        print("PASSED")
+        print("PASS")
         return True
     except AssertionError as e:
-        print(f"FAILED\n  Error: {e}")
+        print(f"FAIL: {e}")
         return False
     except Exception as e:
-        print(f"ERROR\n  Unexpected error: {e}")
+        print(f"ERROR: {e}")
         return False
 
 # Edge case tests
@@ -423,17 +422,8 @@ def main():
         else:
             failed += 1
 
-    # Results
-    print(f"\n=== Edge Case Test Results ===")
-    print(f"Passed: {passed}/{len(tests)}")
-    print(f"Failed: {failed}/{len(tests)}")
-
-    if failed == 0:
-        print("All edge case tests PASSED!")
-        sys.exit(0)
-    else:
-        print(f"{failed} edge case tests FAILED!")
-        sys.exit(1)
+    print(f"\n{passed}/{len(tests)} passed")
+    sys.exit(0 if failed == 0 else 1)
 
 if __name__ == "__main__":
     main()

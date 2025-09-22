@@ -30,7 +30,6 @@ def setup_test_environment():
     """Set up test environment with temporary RocksDB directory"""
     global ROCKSDB_PATH
     ROCKSDB_PATH = tempfile.mkdtemp(prefix="infcache_test_")
-    print(f"Created temporary RocksDB directory: {ROCKSDB_PATH}")
     return ROCKSDB_PATH
 
 def cleanup_test_environment():
@@ -38,7 +37,6 @@ def cleanup_test_environment():
     global ROCKSDB_PATH
     if ROCKSDB_PATH and os.path.exists(ROCKSDB_PATH):
         shutil.rmtree(ROCKSDB_PATH)
-        print(f"Cleaned up RocksDB directory: {ROCKSDB_PATH}")
 
 def check_server_running():
     """Check if database server is running on the expected port"""
@@ -46,45 +44,30 @@ def check_server_running():
         # Try to connect to the server
         r = redis.Redis(host='localhost', port=REDIS_PORT, socket_connect_timeout=2, socket_timeout=2)
         r.ping()
-        print(f"Connected to database server on port {REDIS_PORT}")
-        
-        # Check if our module is loaded by testing if infcache.info command exists
         try:
             r.execute_command('infcache.info')
-            print("Infcache module is loaded and ready")
             return True
         except redis.ResponseError as e:
             if 'unknown command' in str(e).lower():
-                print(f"ERROR: Server is running but infcache module is not loaded")
-                print(f"Please start the server with: --loadmodule {os.path.abspath(MODULE_PATH)}")
+                print(f"ERROR: Infcache module not loaded")
                 return False
-            # Other errors might be normal (like RocksDB not initialized)
-            print("Infcache module appears to be loaded")
             return True
-            
-    except (redis.ConnectionError, redis.TimeoutError) as e:
-        print(f"ERROR: Cannot connect to database server on port {REDIS_PORT}")
-        print(f"Please start a DiceDB/Valkey/Redis server on port {REDIS_PORT} with the infcache module loaded:")
-        print(f"  dicedb-server --port {REDIS_PORT} --loadmodule {os.path.abspath(MODULE_PATH)}")
-        print(f"  # or")
-        print(f"  valkey-server --port {REDIS_PORT} --loadmodule {os.path.abspath(MODULE_PATH)}")
-        return False
+
     except Exception as e:
-        print(f"ERROR: Unexpected error connecting to server: {e}")
+        print(f"ERROR: Connection failed: {e}")
         return False
 
 def run_test(test_func, test_name):
-    """Run a single test and report results"""
     try:
-        print(f"\nRunning: {test_name}...", end=" ")
+        print(f"{test_name}...", end=" ")
         test_func()
-        print("PASSED")
+        print("PASS")
         return True
     except AssertionError as e:
-        print(f"FAILED\n  Error: {e}")
+        print(f"FAIL: {e}")
         return False
     except Exception as e:
-        print(f"ERROR\n  Unexpected error: {e}")
+        print(f"ERROR: {e}")
         return False
 
 # Integration Tests
@@ -92,28 +75,28 @@ def run_test(test_func, test_name):
 def test_basic_eviction_and_restore():
     """Test basic key eviction and restoration"""
     r = redis.Redis(host='localhost', port=REDIS_PORT, decode_responses=True)
-    
+
     # Set a key
     r.set('test_key', 'test_value')
-    
+
     # Fill memory to trigger eviction
     for i in range(1000):
         r.set(f'filler_{i}', 'x' * 5000)
-    
+
     # Check if key was evicted
     if r.get('test_key') is not None:
         print("  Key was not evicted, trying more filler data...")
         for i in range(1000, 2000):
             r.set(f'filler_{i}', 'x' * 5000)
-    
+
     if r.get('test_key') is not None:
         print("  Key still not evicted, skipping basic test")
         return
-    
+
     # Restore the key
     result = r.execute_command('infcache.restore', 'test_key')
     assert result == 'OK', f"Restore failed: {result}"
-    
+
     # Verify restored value
     value = r.get('test_key')
     assert value == 'test_value', f"Restored value mismatch: {value}"
@@ -121,34 +104,34 @@ def test_basic_eviction_and_restore():
 def test_ttl_preservation():
     """Test that TTL is preserved during eviction and restoration"""
     r = redis.Redis(host='localhost', port=REDIS_PORT, decode_responses=True)
-    
+
     # Set a key with TTL
     r.setex('ttl_key', 3600, 'ttl_value')  # 1 hour TTL
     initial_ttl = r.ttl('ttl_key')
-    
+
     # Fill memory to trigger eviction
     for i in range(1000):
         r.set(f'filler_ttl_{i}', 'y' * 5000)
-    
+
     # Check if key was evicted, if not skip TTL test
     if r.get('ttl_key') is not None:
         print("  Key was not evicted, skipping TTL test")
         return
-    
+
     # Wait a bit
     time.sleep(1)
-    
+
     # Restore the key
     result = r.execute_command('infcache.restore', 'ttl_key')
     assert result == 'OK', f"Restore failed: {result}"
-    
+
     # Check TTL is preserved (should be less than initial due to time passed)
     restored_ttl = r.ttl('ttl_key')
     assert restored_ttl > 0, "TTL should be positive"
     assert restored_ttl <= initial_ttl, "TTL should not have increased"
     # Allow for more tolerance in TTL difference
     assert restored_ttl > initial_ttl - 30, "TTL decreased too much"
-    
+
     # Verify value
     value = r.get('ttl_key')
     assert value == 'ttl_value', f"Restored value mismatch: {value}"
@@ -156,22 +139,22 @@ def test_ttl_preservation():
 def test_expired_key_not_restored():
     """Test that expired keys are not restored"""
     r = redis.Redis(host='localhost', port=REDIS_PORT, decode_responses=True)
-    
+
     # Set a key with very short TTL
     r.setex('expire_key', 2, 'expire_value')  # 2 second TTL
-    
+
     # Fill memory to trigger eviction
     for i in range(1000):
         r.set(f'filler_exp_{i}', 'z' * 5000)
-    
+
     # Check if key was evicted
     if r.get('expire_key') is not None:
         print("  Key was not evicted, skipping expiration test")
         return
-    
+
     # Wait for key to expire
     time.sleep(3)
-    
+
     # Try to restore expired key
     try:
         result = r.execute_command('infcache.restore', 'expire_key')
@@ -184,14 +167,14 @@ def test_expired_key_not_restored():
 def test_restore_nonexistent_key():
     """Test restoring a key that doesn't exist in RocksDB"""
     r = redis.Redis(host='localhost', port=REDIS_PORT, decode_responses=True)
-    
+
     result = r.execute_command('infcache.restore', 'nonexistent_key')
     assert result is None, f"Expected None for nonexistent key, got: {result}"
 
 def test_multiple_evictions_and_restores():
     """Test multiple keys being evicted and restored"""
     r = redis.Redis(host='localhost', port=REDIS_PORT, decode_responses=True)
-    
+
     # Set multiple keys
     keys = {}
     for i in range(10):
@@ -199,23 +182,23 @@ def test_multiple_evictions_and_restores():
         value = f'multi_value_{i}'
         r.set(key, value)
         keys[key] = value
-    
+
     # Fill memory to trigger eviction
     for i in range(2000):
         r.set(f'filler_multi_{i}', 'a' * 5000)
-    
+
     # Check keys were evicted
     evicted = []
     for key in keys:
         if r.get(key) is None:
             evicted.append(key)
-    
+
     if len(evicted) == 0:
         print("  No keys were evicted, skipping multi-restore test")
         return
-    
+
     print(f"\n  {len(evicted)} keys were evicted")
-    
+
     # Restore evicted keys
     restored = 0
     for key in evicted:
@@ -227,7 +210,7 @@ def test_multiple_evictions_and_restores():
                 assert value == keys[key], f"Value mismatch for {key}"
         except redis.ResponseError as e:
             print(f"  Failed to restore {key}: {e}")
-    
+
     # At least some keys should be restored
     assert restored > 0, f"No keys were restored out of {len(evicted)} evicted"
     print(f"  {restored}/{len(evicted)} keys successfully restored")
@@ -235,14 +218,14 @@ def test_multiple_evictions_and_restores():
 def test_infcache_info_command():
     """Test the infcache.info command"""
     r = redis.Redis(host='localhost', port=REDIS_PORT, decode_responses=True)
-    
+
     # Trigger some evictions first
     for i in range(100):
         r.set(f'info_key_{i}', 'info_value' * 100)
-    
+
     for i in range(1000):
         r.set(f'filler_info_{i}', 'b' * 5000)
-    
+
     # Get RocksDB stats
     stats = r.execute_command('infcache.info')
     assert stats is not None, "infcache.info returned None"
@@ -252,7 +235,7 @@ def test_infcache_info_command():
 def test_key_with_spaces_and_special_chars():
     """Test keys with spaces and special characters"""
     r = redis.Redis(host='localhost', port=REDIS_PORT, decode_responses=False)  # Use binary mode
-    
+
     # Test various special keys (excluding ones with null bytes which might cause issues)
     special_keys = [
         b'key with spaces',
@@ -260,7 +243,7 @@ def test_key_with_spaces_and_special_chars():
         b'key_with_underscores',
         b'key-with-dashes'
     ]
-    
+
     set_keys = []
     for key in special_keys:
         try:
@@ -268,15 +251,15 @@ def test_key_with_spaces_and_special_chars():
             set_keys.append(key)
         except Exception as e:
             print(f"  Failed to set key {key}: {e}")
-    
+
     if not set_keys:
         print("  No special keys could be set, skipping test")
         return
-    
+
     # Trigger eviction
     for i in range(1000):
         r.set(f'filler_special_{i}'.encode(), b'c' * 5000)
-    
+
     # Restore special keys
     restored = 0
     for key in set_keys:
@@ -289,41 +272,41 @@ def test_key_with_spaces_and_special_chars():
                         restored += 1
             except Exception as e:
                 print(f"  Failed to restore special key {key}: {e}")
-    
+
     print(f"  {restored}/{len(set_keys)} special keys restored successfully")
 
 def test_double_restore():
     """Test that restoring a key twice removes it from RocksDB"""
     r = redis.Redis(host='localhost', port=REDIS_PORT, decode_responses=True)
-    
+
     # Set and evict a key
     r.set('double_key', 'double_value')
-    
+
     # Fill memory to trigger eviction
     for i in range(1000):
         r.set(f'filler_double_{i}', 'd' * 5000)
-    
+
     # Check if key was evicted
     if r.get('double_key') is not None:
         print("  Key was not evicted, trying more filler data...")
         for i in range(1000, 2000):
             r.set(f'filler_double_{i}', 'd' * 5000)
-    
+
     if r.get('double_key') is not None:
         print("  Key still not evicted, skipping double restore test")
         return
-    
+
     # First restore
     result1 = r.execute_command('infcache.restore', 'double_key')
     assert result1 == 'OK', f"First restore failed: {result1}"
-    
+
     # Verify the key was restored
     value1 = r.get('double_key')
     assert value1 == 'double_value', f"Restored value mismatch: {value1}"
-    
+
     # Delete from Redis (not from RocksDB - that should already be done by restore)
     r.delete('double_key')
-    
+
     # Second restore should return None (key was removed from RocksDB after first restore)
     result2 = r.execute_command('infcache.restore', 'double_key')
     assert result2 is None, f"Second restore should return None, got: {result2}"
@@ -331,15 +314,15 @@ def test_double_restore():
 def test_large_value():
     """Test eviction and restoration of large values"""
     r = redis.Redis(host='localhost', port=REDIS_PORT, decode_responses=False)
-    
+
     # Create a smaller large value (100KB instead of 1MB to avoid timeout issues)
     large_value = b'x' * (100 * 1024)
     r.set('large_key', large_value)
-    
+
     # Trigger eviction
     for i in range(200):
         r.set(f'filler_large_{i}'.encode(), b'e' * 50000)
-    
+
     if r.get('large_key') is None:
         # Restore large key
         try:
@@ -720,20 +703,20 @@ def test_absttl_vs_relative_ttl_consistency():
 def main():
     """Main test runner"""
     print("=== DiceDB Infcache Integration Tests ===\n")
-    
+
     # Check if module exists
     if not os.path.exists(MODULE_PATH):
         print(f"ERROR: Module not found at {MODULE_PATH}")
         print("Please run 'make' first to build the module")
         sys.exit(1)
-    
+
     # Check if server is running with module loaded
     if not check_server_running():
         sys.exit(1)
-    
+
     # Setup test environment
     setup_test_environment()
-    
+
     # Run tests
     tests = [
         (test_basic_eviction_and_restore, "Basic eviction and restore"),
@@ -754,10 +737,10 @@ def main():
         (test_multiple_absttl_keys, "Multiple ABSTTL keys"),
         (test_absttl_vs_relative_ttl_consistency, "ABSTTL vs relative TTL consistency")
     ]
-    
+
     passed = 0
     failed = 0
-    
+
     try:
         print(f"\nRunning {len(tests)} integration tests...\n")
         for test_func, test_name in tests:
@@ -768,18 +751,9 @@ def main():
     finally:
         # Cleanup test environment
         cleanup_test_environment()
-    
-    # Results
-    print(f"\n=== Test Results ===")
-    print(f"Passed: {passed}/{len(tests)}")
-    print(f"Failed: {failed}/{len(tests)}")
-    
-    if failed == 0:
-        print("All tests PASSED!")
-        sys.exit(0)
-    else:
-        print(f"{failed} tests FAILED!")
-        sys.exit(1)
+
+    print(f"\n{passed}/{len(tests)} passed")
+    sys.exit(0 if failed == 0 else 1)
 
 if __name__ == "__main__":
     main()
