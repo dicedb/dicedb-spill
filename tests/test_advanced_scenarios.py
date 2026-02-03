@@ -29,7 +29,7 @@ except ImportError:
         sys.exit(1)
 
 # Test configuration
-TEST_PORT = 8379
+TEST_PORT = 6379
 
 def run_test(test_func, test_name):
     try:
@@ -482,7 +482,7 @@ def main():
         r = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True, socket_connect_timeout=2)
         r.ping()
     except:
-        print("ERROR: Cannot connect to database server on port 8379")
+        print("ERROR: Cannot connect to database server on port 6379")
         print("Please start DiceDB server with infcache module loaded")
         sys.exit(1)
 

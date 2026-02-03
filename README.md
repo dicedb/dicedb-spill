@@ -1,6 +1,6 @@
 # DiceDB Infinite Cache Module
 
-A high-performance infinite cache module for DiceDB that automatically persists evicted keys to RocksDB storage, providing unlimited cache capacity with transparent key restoration and full TTL preservation.
+An infinite cache module for DiceDB that automatically persists evicted keys to RocksDB storage, providing disk bound cache capacity with transparent key restoration and full TTL preservation.
 
 ## Features
 
@@ -13,30 +13,57 @@ A high-performance infinite cache module for DiceDB that automatically persists 
 
 ## Quick Start
 
+### Cloning
+
+Please note, this repository should be cloned as a submodule
+and hence must be present at `modules/dicedb-infcache` in the
+dicedb repository.
+
 ### Prerequisites
 
-Install RocksDB development libraries:
+Install RocksDB (requires root/sudo):
 
 ```bash
-$ bash scripts/install_rocksdb.sh
+# Basic build (portable, no compression)
+$ sudo ./scripts/install_rocksdb.sh
+
+# With compression support
+$ sudo ENABLE_COMPRESSION=1 ./scripts/install_rocksdb.sh
+
+# With native CPU optimizations (SIMD, AVX - better performance, less portable)
+$ sudo PORTABLE=0 ./scripts/install_rocksdb.sh
+
+# Full optimization (compression + native CPU optimizations)
+$ sudo ENABLE_COMPRESSION=1 PORTABLE=0 ./scripts/install_rocksdb.sh
 ```
 
-### Build and Load Module
+**Build options:**
+| Option | Default | Description |
+|--------|---------|-------------|
+| `ENABLE_COMPRESSION` | 0 | Enable compression libraries (snappy, zlib, bz2, lz4, zstd) |
+| `PORTABLE` | 1 | Cross-CPU compatible build. Set to 0 for native CPU optimizations |
+
+### Build Module
 
 ```bash
+# Without compression
 $ make
+
+# With compression support (must match RocksDB build)
+$ make ENABLE_COMPRESSION=1
 ```
 
 ### Basic Configuration
 
 ```bash
-# Load with custom settings
-$ dicedb-server -p 8379 \
-    --loadmodule ./lib-infcache.so \
+$ dicedb-server -p 6379 \
+    --loadmodule ./modules/dicedb-infcache/lib-infcache.so \
     path /tmp/dicedb-l2 \
     compression 1 \
     write_buffer_size 67108864
 ```
+
+Note: The `compression` module parameter only works if RocksDB was built with compression support (`ENABLE_COMPRESSION=1`).
 
 ## Documentation
 
@@ -72,7 +99,8 @@ $ make test
 
 - O(1) persistence on eviction with batched writes
 - O(1) key restoration from RocksDB
-- Snappy compression reduces disk usage by ~50%
+- Snappy compression reduces disk usage by ~50% (when enabled)
+- Native CPU optimizations (SIMD/AVX) available with `PORTABLE=0`
 - Write buffer batching minimizes disk I/O
 - Automatic expiration prevents storage bloat
 
@@ -81,7 +109,7 @@ $ make test
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `path` | /tmp/dicedb-l2 | RocksDB database directory |
-| `compression` | 1 | Enable Snappy compression |
+| `compression` | 1 | Enable Snappy compression (requires ENABLE_COMPRESSION=1 build) |
 | `write_buffer_size` | 64MB | Write buffer size |
 | `max_open_files` | 1000 | Maximum open file descriptors |
 | `block_size` | 4KB | SST file block size |

@@ -44,6 +44,19 @@ check_prerequisites() {
     fi
 }
 
+setup_python_env() {
+    if [ ! -d "venv" ]; then
+        print_status "INFO" "Creating virtual environment"
+        python3 -m venv venv
+    fi
+    source venv/bin/activate
+    print_status "INFO" "Installing Python dependencies"
+    if [ -f "requirements.txt" ]; then
+        pip install -r requirements.txt >/dev/null 2>&1
+    fi
+    pip install redis valkey 2>/dev/null || pip install redis 2>/dev/null || true
+}
+
 run_unit_tests() {
     print_status "INFO" "Unit tests"
     gcc -std=c99 -o "$UNIT_TEST_BINARY" test_unit.c -DNDEBUG || {
@@ -68,60 +81,44 @@ run_integration_tests() {
         return 0
     else
         print_status "ERROR" "Integration tests failed"
-        print_status "INFO" "Ensure DiceDB server on port 8379 with infcache module"
+        print_status "INFO" "Ensure DiceDB server on port 6379 with infcache module"
         return 1
     fi
 }
 
 run_edge_case_tests() {
     print_status "INFO" "Edge case tests"
-    [ ! -d "venv" ] && python3 -m venv venv
-    source venv/bin/activate
-    pip install redis valkey 2>/dev/null || pip install redis 2>/dev/null || true
     if python3 "$EDGE_CASE_TEST_SCRIPT"; then
         print_status "SUCCESS" "Edge case tests"
-        deactivate
         return 0
     else
         print_status "ERROR" "Edge case tests failed"
-        deactivate
         return 1
     fi
 }
 
 run_lifecycle_tests() {
     print_status "INFO" "Lifecycle tests"
-    [ ! -d "venv" ] && python3 -m venv venv
-    source venv/bin/activate
-    pip install redis valkey 2>/dev/null || pip install redis 2>/dev/null || true
     if ! command -v dicedb-server &> /dev/null; then
         print_status "WARNING" "dicedb-server not found, skipping"
-        deactivate
         return 0
     fi
     if python3 "test_module_lifecycle.py"; then
         print_status "SUCCESS" "Lifecycle tests"
-        deactivate
         return 0
     else
         print_status "ERROR" "Lifecycle tests failed"
-        deactivate
         return 1
     fi
 }
 
 run_advanced_tests() {
     print_status "INFO" "Advanced tests"
-    [ ! -d "venv" ] && python3 -m venv venv
-    source venv/bin/activate
-    pip install redis valkey 2>/dev/null || pip install redis 2>/dev/null || true
     if python3 "$ADVANCED_SCENARIOS_SCRIPT"; then
         print_status "SUCCESS" "Advanced tests"
-        deactivate
         return 0
     else
         print_status "ERROR" "Advanced tests failed"
-        deactivate
         return 1
     fi
 }
@@ -131,7 +128,7 @@ run_performance_tests() {
     python3 << 'EOF'
 import redis, time, sys
 try:
-    r = redis.Redis(host='localhost', port=8379, decode_responses=True)
+    r = redis.Redis(host='localhost', port=6379, decode_responses=True)
     r.ping()
 
     start_time = time.time()
@@ -260,6 +257,7 @@ main() {
     local tests_passed=0
 
     check_prerequisites
+    setup_python_env
 
     [ $RUN_UNIT -eq 1 ] && { tests_run=$((tests_run + 1)); run_unit_tests && tests_passed=$((tests_passed + 1)) || exit_code=1; }
     [ $RUN_INTEGRATION -eq 1 ] && { tests_run=$((tests_run + 1)); run_integration_tests && tests_passed=$((tests_passed + 1)) || exit_code=1; }
@@ -267,6 +265,8 @@ main() {
     [ $RUN_LIFECYCLE -eq 1 ] && { tests_run=$((tests_run + 1)); run_lifecycle_tests && tests_passed=$((tests_passed + 1)) || exit_code=1; }
     [ $RUN_ADVANCED -eq 1 ] && { tests_run=$((tests_run + 1)); run_advanced_tests && tests_passed=$((tests_passed + 1)) || exit_code=1; }
     [ $RUN_PERFORMANCE -eq 1 ] && { tests_run=$((tests_run + 1)); run_performance_tests && tests_passed=$((tests_passed + 1)) || exit_code=1; }
+
+    deactivate
 
     echo "Test Summary: $tests_passed/$tests_run passed"
     [ $exit_code -eq 0 ] && print_status "SUCCESS" "All tests passed" || print_status "ERROR" "Some tests failed"

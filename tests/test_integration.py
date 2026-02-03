@@ -22,7 +22,7 @@ except ImportError:
         sys.exit(1)
 
 # Test configuration
-REDIS_PORT = 8379
+REDIS_PORT = 6379
 MODULE_PATH = "../lib-infcache.so"
 ROCKSDB_PATH = None  # Will be set to temp directory
 

@@ -23,13 +23,13 @@ class InfcacheIntegrationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Set up test environment and connection"""
-        cls.client = redis.Redis(host='localhost', port=8379, decode_responses=True)
+        cls.client = redis.Redis(host='localhost', port=6379, decode_responses=True)
 
         # Test connection
         try:
             cls.client.ping()
         except redis.ConnectionError:
-            raise Exception("Cannot connect to DiceDB on port 8379")
+            raise Exception("Cannot connect to DiceDB on port 6379")
 
         # Store original maxmemory settings
         try:
@@ -251,7 +251,7 @@ class InfcacheIntegrationTest(unittest.TestCase):
 
         def worker(thread_id):
             try:
-                client = redis.Redis(host='localhost', port=8379, decode_responses=True)
+                client = redis.Redis(host='localhost', port=6379, decode_responses=True)
 
                 # Set keys
                 for i in range(num_keys_per_thread):
@@ -431,7 +431,7 @@ def run_tests():
 
     # Test connection first
     try:
-        client = redis.Redis(host='localhost', port=8379, decode_responses=True)
+        client = redis.Redis(host='localhost', port=6379, decode_responses=True)
         client.ping()
         print("✓ Connected to DiceDB successfully")
     except Exception as e:

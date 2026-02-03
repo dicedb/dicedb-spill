@@ -3,10 +3,20 @@ SHOBJ_LDFLAGS ?= -shared
 
 MODULE_NAME = lib-infcache
 MODULE_SO = $(MODULE_NAME).so
-MODULE_H_DIR = /home/arpit/workspace/dicedb/dice2/src
+MODULE_H_DIR = ../../src
+
+# Compression support: set ENABLE_COMPRESSION=1 to link compression libraries
+ENABLE_COMPRESSION ?= 0
 
 INCLUDES = -I/usr/local/include
-LIBS = -lrocksdb -lstdc++ -lpthread -ldl
+LIBS_BASE = -L/usr/local/lib -lrocksdb -lstdc++ -lpthread -ldl
+LIBS_COMPRESSION = -lsnappy -lz -lbz2 -llz4 -lzstd
+
+ifeq ($(ENABLE_COMPRESSION),1)
+LIBS = $(LIBS_BASE) $(LIBS_COMPRESSION)
+else
+LIBS = $(LIBS_BASE)
+endif
 
 .SUFFIXES:
 .PHONY: all clean test
