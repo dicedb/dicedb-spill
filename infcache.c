@@ -10,6 +10,8 @@
 #define likely(x)   __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
 
+#define MIN_MAX_MEMORY_MB 20  // Minimum max-memory limit: 20MB
+
 // Logging control: set to 1 to enable debug/verbose logging, 0 to disable
 #define INFCACHE_DEBUG 0
 
@@ -63,6 +65,90 @@ static void DeleteKeyFromDB(const char *keyname, size_t keylen) {
     }
 }
 
+// Helper function to restore a key from RocksDB
+// Returns: 0 on success, -1 on error, -2 if key not found, -3 if expired
+static int RestoreKeyFromDB(ValkeyModuleCtx *ctx, ValkeyModuleString *key, const char *keyname, size_t keylen) {
+    if (!db) return -1;
+
+    char *err = NULL;
+    size_t vallen;
+    char *val = rocksdb_get(db, roptions, keyname, keylen, &vallen, &err);
+
+    if (err != NULL) {
+        LOG(ctx, "warning", "infcache: error getting key=%.*s from RocksDB: %s", (int)keylen, keyname, err);
+        free(err);
+        return -1;
+    }
+
+    if (val == NULL) {
+        LOG(ctx, "notice", "infcache: key=%.*s not found not in RocksDB", (int)keylen, keyname);
+        return -2;
+    }
+
+    LOG(ctx, "notice", "infcache: key=%.*s found in RocksDB with value_len=%zu bytes", (int)keylen, keyname, vallen);
+
+    // Validate data format
+    if (vallen < sizeof(int64_t)) {
+        free(val);
+        return -1;
+    }
+
+    char *ptr = val;
+    int64_t expiry_time_ms;
+    memcpy(&expiry_time_ms, ptr, sizeof(int64_t));
+    ptr += sizeof(int64_t);
+
+    // Check if key has expired
+    if (expiry_time_ms > 0) {
+        int64_t current_time_ms = (int64_t)time(NULL) * 1000;
+        if (expiry_time_ms <= current_time_ms) {
+            LOG(ctx, "notice", "infcache: key=%.*s has expired (expiry=%lld, now=%lld), deleting",
+                (int)keylen, keyname, (long long)expiry_time_ms, (long long)current_time_ms);
+            __sync_fetch_and_add(&stats.keys_expired, 1);
+            DeleteKeyFromDB(keyname, keylen);
+            free(val);
+            return -3;
+        }
+    }
+
+    size_t dump_len = vallen - sizeof(int64_t);
+    ValkeyModuleString *dump_data = ValkeyModule_CreateString(ctx, ptr, dump_len);
+
+    // Convert absolute expiry time back to relative TTL for RESTORE
+    ValkeyModuleCallReply *reply;
+    if (expiry_time_ms > 0) {
+        int64_t current_time_ms = (int64_t)time(NULL) * 1000;
+        int64_t ttl_ms = expiry_time_ms - current_time_ms;
+        if (ttl_ms < 0) ttl_ms = 1;  // Minimum 1ms TTL
+        LOG(ctx, "debug", "infcache: restoring key=%.*s with TTL=%lld ms", (int)keylen, keyname, (long long)ttl_ms);
+        reply = ValkeyModule_Call(ctx, "RESTORE", "slsc", key, ttl_ms, dump_data, "REPLACE");
+    } else {
+        LOG(ctx, "debug", "infcache: restoring key=%.*s with no expiry", (int)keylen, keyname);
+        reply = ValkeyModule_Call(ctx, "RESTORE", "slsc", key, 0, dump_data, "REPLACE");
+    }
+
+    free(val);
+    ValkeyModule_FreeString(ctx, dump_data);
+
+    int result = 0;
+    if (reply && ValkeyModule_CallReplyType(reply) != VALKEYMODULE_REPLY_ERROR) {
+        LOG(ctx, "debug", "infcache: key=%.*s restored successfully", (int)keylen, keyname);
+        __sync_fetch_and_add(&stats.keys_restored, 1);
+        __sync_fetch_and_add(&stats.bytes_read, vallen);
+        DeleteKeyFromDB(keyname, keylen);
+    } else {
+        LOG(ctx, "warning", "infcache: failed to restore key=%.*s: %s", (int)keylen, keyname,
+            reply ? (ValkeyModule_CallReplyStringPtr(reply, NULL) ? ValkeyModule_CallReplyStringPtr(reply, NULL) : "no reply") : "no reply");
+        result = -1;
+    }
+
+    if (reply) {
+        ValkeyModule_FreeCallReply(reply);
+    }
+
+    return result;
+}
+
 int ParseModuleArgs(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     for (int i = 0; i < argc; i += 2) {
         if (i + 1 >= argc) break;
@@ -76,9 +162,9 @@ int ParseModuleArgs(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
             config.path = strdup(value);
         } else if (strcasecmp(key, "max-memory") == 0 || strcasecmp(key, "max_memory") == 0) {
             config.max_memory = (size_t)atoll(value);
-            if (config.max_memory < 64 * 1024 * 1024) {
-                ValkeyModule_Log(ctx, "warning", "infcache: max-memory too low (%zu bytes), using minimum 64MB", config.max_memory);
-                config.max_memory = 64 * 1024 * 1024;
+            if (config.max_memory < MIN_MAX_MEMORY_MB * 1024 * 1024) {
+                ValkeyModule_Log(ctx, "warning", "infcache: max-memory must be at least %dMB, got %zu bytes", MIN_MAX_MEMORY_MB, config.max_memory);
+                return VALKEYMODULE_ERR;
             }
         }
     }
@@ -97,24 +183,27 @@ int InitRocksDB(ValkeyModuleCtx *ctx) {
         config.path, config.max_memory);
 
     // Calculate memory distribution from max_memory budget
-    size_t block_cache_size = config.max_memory / 2;        // 50% for block cache (read cache)
-    size_t write_buffer_size = config.max_memory / 6;       // ~17% per buffer (3 buffers = 50%)
-    // Remaining memory (~33%) is used for indexes, bloom filters, and other structures
+    size_t block_cache_size = 8 * 1024 * 1024;              // 8MB for block cache (read cache)
+    size_t remaining_memory = config.max_memory - block_cache_size;
+    size_t write_buffer_size = (remaining_memory * 2) / 3;  // 2/3 of remaining for write buffers
+    // Remaining 1/3 is used for indexes, bloom filters, and other structures
 
     options = rocksdb_options_create();
 
-    // Create DB if missing - essential for first run when eviction tier doesn't exist yet
+    // Create DB if missing and don't error if exists
     rocksdb_options_set_create_if_missing(options, 1);
-
-    // Don't error if exists - allows reusing existing eviction tier across restarts
     rocksdb_options_set_error_if_exists(options, 0);
 
+    // When enabled, RocksDB becomes much stricter about detecting corruption or unexpected errors.
+    // Verifies checksums more strictly
+    // Fails fast on file corruption
     // Disable paranoid checks - trades some safety for better write performance in eviction path
     rocksdb_options_set_paranoid_checks(options, 0);
 
     // Enable Snappy compression - reduces disk usage for evicted data (2-4x compression typical)
     rocksdb_options_set_compression(options, rocksdb_snappy_compression);
 
+    // Memtable Configuration
     // Write buffer size - larger buffers reduce write amplification but use more memory
     rocksdb_options_set_write_buffer_size(options, write_buffer_size);
 
@@ -125,13 +214,13 @@ int InitRocksDB(ValkeyModuleCtx *ctx) {
     rocksdb_options_set_max_open_files(options, 1000);
 
     // Optimize for point lookups - critical since we restore individual keys on cache miss
+    // make single-key lookups (Get) faster and cheaper.
+    // takes block_cache_size as parameter to size internal data structures accordingly.
     rocksdb_options_optimize_for_point_lookup(options, 64);
 
-    // Enable mmap for reads - reduces system call overhead and improves read performance
-    rocksdb_options_set_allow_mmap_reads(options, 1);
-
-    // Enable mmap for writes - improves write throughput during heavy eviction
-    rocksdb_options_set_allow_mmap_writes(options, 1);
+    // Disable mmap for reads and writes to reduce memory overhead.
+    rocksdb_options_set_allow_mmap_reads(options, 0);
+    rocksdb_options_set_allow_mmap_writes(options, 0);
 
     // Background compactions - limits to 2 threads to avoid CPU contention with Redis/Valkey
     rocksdb_options_set_max_background_compactions(options, 2);
@@ -233,78 +322,8 @@ int PremissNotification(ValkeyModuleCtx *ctx, int type, const char *event, Valke
 
     LOG(ctx, "notice", "infcache: premiss called for key=%.*s (len=%zu)", (int)keylen, keyname, keylen);
     LOG(ctx, "debug", "infcache: checking RocksDB for key=%.*s", (int)keylen, keyname);
-    char *err = NULL;
-    size_t vallen;
-    char *val = rocksdb_get(db, roptions, keyname, keylen, &vallen, &err);
 
-    if (err != NULL) {
-        LOG(ctx, "warning", "infcache: error getting key=%.*s from RocksDB: %s", (int)keylen, keyname, err);
-        free(err);
-        return 0;
-    }
-
-    if (val == NULL) {
-        LOG(ctx, "notice", "infcache: key=%.*s not found not in RocksDB", (int)keylen, keyname);
-        return 0;
-    }
-
-    LOG(ctx, "notice", "infcache: key=%.*s found in RocksDB with value_len=%zu bytes", (int)keylen, keyname, vallen);
-    if (vallen < sizeof(int64_t)) {
-        free(val);
-        return 0;
-    }
-
-    char *ptr = val;
-    int64_t expiry_time_ms;  // Absolute expiry timestamp
-    memcpy(&expiry_time_ms, ptr, sizeof(int64_t));
-    ptr += sizeof(int64_t);
-
-    // Check if key has expired
-    if (expiry_time_ms > 0) {
-        int64_t current_time_ms = (int64_t)time(NULL) * 1000;
-        if (expiry_time_ms <= current_time_ms) {
-            LOG(ctx, "notice", "infcache: key=%.*s has expired (expiry=%lld, now=%lld), deleting",
-                (int)keylen, keyname, (long long)expiry_time_ms, (long long)current_time_ms);
-            __sync_fetch_and_add(&stats.keys_expired, 1);
-            DeleteKeyFromDB(keyname, keylen);
-            free(val);
-            return 0;
-        }
-    }
-
-    size_t dump_len = vallen - sizeof(int64_t);
-    ValkeyModuleString *dump_data = ValkeyModule_CreateString(ctx, ptr, dump_len);
-
-    // Convert absolute expiry time back to relative TTL for RESTORE
-    ValkeyModuleCallReply *reply;
-    if (expiry_time_ms > 0) {
-        int64_t current_time_ms = (int64_t)time(NULL) * 1000;
-        int64_t ttl_ms = expiry_time_ms - current_time_ms;
-        if (ttl_ms < 0) ttl_ms = 1;  // Minimum 1ms TTL
-        LOG(ctx, "debug", "infcache: restoring key=%.*s with TTL=%lld ms", (int)keylen, keyname, (long long)ttl_ms);
-        reply = ValkeyModule_Call(ctx, "RESTORE", "slsc", key, ttl_ms, dump_data, "REPLACE");
-    } else {
-        LOG(ctx, "debug", "infcache: restoring key=%.*s with no expiry", (int)keylen, keyname);
-        reply = ValkeyModule_Call(ctx, "RESTORE", "slsc", key, 0, dump_data, "REPLACE");
-    }
-
-    free(val);
-    ValkeyModule_FreeString(ctx, dump_data);
-
-    if (reply && ValkeyModule_CallReplyType(reply) != VALKEYMODULE_REPLY_ERROR) {
-        LOG(ctx, "debug", "infcache: key=%.*s restored successfully", (int)keylen, keyname);
-        __sync_fetch_and_add(&stats.keys_restored, 1);
-        __sync_fetch_and_add(&stats.bytes_read, vallen);
-        DeleteKeyFromDB(keyname, keylen);
-    } else {
-        LOG(ctx, "warning", "infcache: failed to restore key=%.*s: %s", (int)keylen, keyname,
-            reply ? (ValkeyModule_CallReplyStringPtr(reply, NULL) ? ValkeyModule_CallReplyStringPtr(reply, NULL) : "no reply") : "no reply");
-    }
-
-    if (reply) {
-        ValkeyModule_FreeCallReply(reply);
-    }
-
+    RestoreKeyFromDB(ctx, key, keyname, keylen);
     return 0;
 }
 
@@ -419,81 +438,18 @@ int RestoreCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
         return ValkeyModule_ReplyWithError(ctx, "ERR Invalid key data");
     }
 
-    char *err = NULL;
-    size_t vallen;
-    char *val = rocksdb_get(db, roptions, keyname, keylen, &vallen, &err);
+    int result = RestoreKeyFromDB(ctx, argv[1], keyname, keylen);
 
-    if (err != NULL) {
-        ValkeyModule_ReplyWithError(ctx, err);
-        free(err);
-        return VALKEYMODULE_OK;
-    }
-
-    if (val == NULL) {
-        return ValkeyModule_ReplyWithNull(ctx);
-    }
-
-    if (vallen < sizeof(int64_t)) {
-        free(val);
-        return ValkeyModule_ReplyWithError(ctx, ERR_CORRUPTED_DATA);
-    }
-
-    char *ptr = val;
-    int64_t expiry_time_ms;  // Absolute expiry timestamp
-    memcpy(&expiry_time_ms, ptr, sizeof(int64_t));
-    ptr += sizeof(int64_t);
-
-    // Check if key has expired
-    if (expiry_time_ms > 0) {
-        int64_t current_time_ms = (int64_t)time(NULL) * 1000;
-        if (expiry_time_ms <= current_time_ms) {
-            LOG(ctx, "notice", "infcache: key=%.*s has expired (expiry=%lld, now=%lld), deleting",
-                (int)keylen, keyname, (long long)expiry_time_ms, (long long)current_time_ms);
-            __sync_fetch_and_add(&stats.keys_expired, 1);
-            DeleteKeyFromDB(keyname, keylen);
-            free(val);
+    switch (result) {
+        case 0:
+            return ValkeyModule_ReplyWithSimpleString(ctx, "OK");
+        case -2:
+            return ValkeyModule_ReplyWithNull(ctx);
+        case -3:
             return ValkeyModule_ReplyWithError(ctx, "ERR Key has expired");
-        }
+        default:
+            return ValkeyModule_ReplyWithError(ctx, ERR_CORRUPTED_DATA);
     }
-
-    size_t dump_len = vallen - sizeof(int64_t);
-    ValkeyModuleString *dump_data = ValkeyModule_CreateString(ctx, ptr, dump_len);
-
-    // Convert absolute expiry time back to relative TTL for RESTORE
-    ValkeyModuleCallReply *reply;
-    if (expiry_time_ms > 0) {
-        int64_t current_time_ms = (int64_t)time(NULL) * 1000;
-        int64_t ttl_ms = expiry_time_ms - current_time_ms;
-        if (ttl_ms < 0) ttl_ms = 1;  // Minimum 1ms TTL
-        LOG(ctx, "debug", "infcache: restoring key=%.*s with TTL=%lld ms", (int)keylen, keyname, (long long)ttl_ms);
-        reply = ValkeyModule_Call(ctx, "RESTORE", "slsc", argv[1], ttl_ms, dump_data, "REPLACE");
-    } else {
-        LOG(ctx, "debug", "infcache: restoring key=%.*s with no expiry", (int)keylen, keyname);
-        reply = ValkeyModule_Call(ctx, "RESTORE", "slsc", argv[1], 0, dump_data, "REPLACE");
-    }
-
-    free(val);
-    ValkeyModule_FreeString(ctx, dump_data);
-
-    if (reply && ValkeyModule_CallReplyType(reply) == VALKEYMODULE_REPLY_ERROR) {
-        const char *errmsg = ValkeyModule_CallReplyStringPtr(reply, NULL);
-        LOG(ctx, "warning", "infcache: restore command failed for key=%.*s: %s",
-            (int)keylen, keyname, errmsg ? errmsg : "unknown");
-        ValkeyModule_ReplyWithError(ctx, errmsg);
-    } else {
-        LOG(ctx, "debug", "infcache: restore command succeeded for key=%.*s, size=%zu",
-            (int)keylen, keyname, vallen);
-        ValkeyModule_ReplyWithSimpleString(ctx, "OK");
-        __sync_fetch_and_add(&stats.keys_restored, 1);
-        __sync_fetch_and_add(&stats.bytes_read, vallen);
-        DeleteKeyFromDB(keyname, keylen);
-    }
-
-    if (reply) {
-        ValkeyModule_FreeCallReply(reply);
-    }
-
-    return VALKEYMODULE_OK;
 }
 
 int CleanupCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
@@ -652,7 +608,7 @@ int InfoCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     }
 
     // Infcache section - our custom metrics
-    append_info_section(&buffer, &size, &capacity, "Infcache");
+    append_info_section(&buffer, &size, &capacity, "infcache");
     append_info_line_int(&buffer, &size, &capacity, "keys_stored", stats.keys_stored);
     append_info_line_int(&buffer, &size, &capacity, "keys_restored", stats.keys_restored);
     append_info_line_int(&buffer, &size, &capacity, "keys_expired", stats.keys_expired);
@@ -667,7 +623,7 @@ int InfoCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     append_info_line(&buffer, &size, &capacity, "max_memory", max_mem_str);
 
     // RocksDB Memory section
-    append_info_section(&buffer, &size, &capacity, "RocksDB_Memory");
+    append_info_section(&buffer, &size, &capacity, "rocksdb_memory");
 
     int64_t block_cache_usage = get_rocksdb_int_property("rocksdb.block-cache-usage");
     if (block_cache_usage >= 0) {
@@ -702,7 +658,7 @@ int InfoCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     }
 
     // RocksDB Storage section
-    append_info_section(&buffer, &size, &capacity, "RocksDB_Storage");
+    append_info_section(&buffer, &size, &capacity, "rocksdb_storage");
 
     int64_t num_keys = get_rocksdb_int_property("rocksdb.estimate-num-keys");
     if (num_keys >= 0) {
@@ -731,7 +687,7 @@ int InfoCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     }
 
     // RocksDB Compaction section
-    append_info_section(&buffer, &size, &capacity, "RocksDB_Compaction");
+    append_info_section(&buffer, &size, &capacity, "rocksdb_compaction");
 
     int64_t num_immutable = get_rocksdb_int_property("rocksdb.num-immutable-mem-table");
     if (num_immutable >= 0) {

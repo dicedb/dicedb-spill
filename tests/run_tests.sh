@@ -112,6 +112,17 @@ run_lifecycle_tests() {
     fi
 }
 
+run_memory_config_tests() {
+    print_status "INFO" "Memory configuration tests"
+    if python3 "test_memory_config.py"; then
+        print_status "SUCCESS" "Memory configuration tests"
+        return 0
+    else
+        print_status "ERROR" "Memory configuration tests failed"
+        return 1
+    fi
+}
+
 run_advanced_tests() {
     print_status "INFO" "Advanced tests"
     if python3 "$ADVANCED_SCENARIOS_SCRIPT"; then
