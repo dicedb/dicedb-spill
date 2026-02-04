@@ -128,13 +128,12 @@ def test_module_loading_with_default_config():
 
 def test_module_loading_with_custom_config():
     """Test module loading with custom configuration parameters"""
-    custom_db_path = tempfile.mkdtemp(prefix="custom_rocksdb_")
+    custom_path = tempfile.mkdtemp(prefix="custom_rocksdb_")
 
     try:
         module_args = [
-            'path', custom_db_path,
-            'compression', '0',
-            'write_buffer_size', '33554432'  # 32MB
+            'path', custom_path,
+            'max-memory', str(128 * 1024 * 1024)  # 128MB
         ]
 
         with temporary_dicedb_server(TEST_PORT, module_args) as (proc, temp_dir):
@@ -145,27 +144,32 @@ def test_module_loading_with_custom_config():
             assert isinstance(stats, list), "Stats should return list"
 
             # Verify custom RocksDB path is being used
-            assert os.path.exists(custom_db_path), "Custom RocksDB path should exist"
+            assert os.path.exists(custom_path), "Custom RocksDB path should exist"
 
     finally:
-        if os.path.exists(custom_db_path):
-            shutil.rmtree(custom_db_path)
+        if os.path.exists(custom_path):
+            shutil.rmtree(custom_path)
 
 def test_module_config_validation():
     """Test configuration parameter validation"""
-    # Test with invalid parameters (should still load but use defaults)
-    module_args = [
-        'path', '/invalid/path/that/cannot/be/created',
-        'compression', 'invalid_value',
-        'write_buffer_size', 'not_a_number'
-    ]
+    valid_path = tempfile.mkdtemp(prefix="config_validation_")
 
-    with temporary_dicedb_server(TEST_PORT, module_args) as (proc, temp_dir):
-        r = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True)
+    try:
+        # Test with invalid max-memory (too low) - should use minimum value
+        module_args = [
+            'path', valid_path,
+            'max-memory', '1000'  # Too low, should be clamped to 64MB minimum
+        ]
 
-        # Should still work with fallback to defaults
-        stats = r.execute_command('infcache.stats')
-        assert isinstance(stats, list), "Stats should work even with invalid config"
+        with temporary_dicedb_server(TEST_PORT, module_args) as (proc, temp_dir):
+            r = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True)
+
+            # Should still work with fallback to defaults
+            stats = r.execute_command('infcache.stats')
+            assert isinstance(stats, list), "Stats should work even with invalid config"
+    finally:
+        if os.path.exists(valid_path):
+            shutil.rmtree(valid_path)
 
 def test_persistence_across_restart():
     """Test that data persists across server restarts"""

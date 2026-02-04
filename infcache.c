@@ -36,36 +36,17 @@ typedef struct {
 
 static InfcacheStats stats = {0};
 
-#define BLOOM_FILTER_BITS_PER_KEY 10
-#define LRU_CACHE_SIZE (64 * 1024 * 1024)
-
 static const char *ERR_DB_NOT_INIT = "ERR RocksDB not initialized";
 static const char *ERR_CORRUPTED_DATA = "ERR Corrupted data in RocksDB";
 
 typedef struct {
-    char *db_path;
-    int create_if_missing;
-    int error_if_exists;
-    int paranoid_checks;
-    int compression;
-    size_t write_buffer_size;
-    int max_open_files;
-    size_t block_size;
-    int block_restart_interval;
-    size_t max_file_size;
+    char *path;
+    size_t max_memory;  // Maximum memory budget for RocksDB (block cache + write buffers)
 } InfcacheConfig;
 
 static InfcacheConfig config = {
-    .db_path = NULL,
-    .create_if_missing = 1,
-    .error_if_exists = 0,
-    .paranoid_checks = 0,
-    .compression = 1,
-    .write_buffer_size = 64 * 1024 * 1024,
-    .max_open_files = 1000,
-    .block_size = 4 * 1024,
-    .block_restart_interval = 16,
-    .max_file_size = 64 * 1024 * 1024
+    .path = NULL,
+    .max_memory = 256 * 1024 * 1024  // Default: 256MB total memory budget
 };
 
 static void DeleteKeyFromDB(const char *keyname, size_t keylen) {
@@ -91,30 +72,18 @@ int ParseModuleArgs(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
         const char *value = ValkeyModule_StringPtrLen(argv[i + 1], &vallen);
 
         if (strcasecmp(key, "path") == 0) {
-            if (config.db_path) free(config.db_path);
-            config.db_path = strdup(value);
-        } else if (strcasecmp(key, "create_if_missing") == 0) {
-            config.create_if_missing = atoi(value);
-        } else if (strcasecmp(key, "error_if_exists") == 0) {
-            config.error_if_exists = atoi(value);
-        } else if (strcasecmp(key, "paranoid_checks") == 0) {
-            config.paranoid_checks = atoi(value);
-        } else if (strcasecmp(key, "compression") == 0) {
-            config.compression = atoi(value);
-        } else if (strcasecmp(key, "write_buffer_size") == 0) {
-            config.write_buffer_size = (size_t)atoll(value);
-        } else if (strcasecmp(key, "max_open_files") == 0) {
-            config.max_open_files = atoi(value);
-        } else if (strcasecmp(key, "block_size") == 0) {
-            config.block_size = (size_t)atoll(value);
-        } else if (strcasecmp(key, "block_restart_interval") == 0) {
-            config.block_restart_interval = atoi(value);
-        } else if (strcasecmp(key, "max_file_size") == 0) {
-            config.max_file_size = (size_t)atoll(value);
+            if (config.path) free(config.path);
+            config.path = strdup(value);
+        } else if (strcasecmp(key, "max-memory") == 0 || strcasecmp(key, "max_memory") == 0) {
+            config.max_memory = (size_t)atoll(value);
+            if (config.max_memory < 64 * 1024 * 1024) {
+                ValkeyModule_Log(ctx, "warning", "infcache: max-memory too low (%zu bytes), using minimum 64MB", config.max_memory);
+                config.max_memory = 64 * 1024 * 1024;
+            }
         }
     }
 
-    if (!config.db_path) {
+    if (!config.path) {
         ValkeyModule_Log(ctx, "warning", "infcache: 'path' parameter is required");
         return VALKEYMODULE_ERR;
     }
@@ -124,58 +93,103 @@ int ParseModuleArgs(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
 
 int InitRocksDB(ValkeyModuleCtx *ctx) {
     char *err = NULL;
-    LOG(ctx, "debug", "infcache: initializing RocksDB at path=%s", config.db_path);
+    LOG(ctx, "debug", "infcache: initializing RocksDB at path=%s with max_memory=%zu bytes",
+        config.path, config.max_memory);
+
+    // Calculate memory distribution from max_memory budget
+    size_t block_cache_size = config.max_memory / 2;        // 50% for block cache (read cache)
+    size_t write_buffer_size = config.max_memory / 6;       // ~17% per buffer (3 buffers = 50%)
+    // Remaining memory (~33%) is used for indexes, bloom filters, and other structures
 
     options = rocksdb_options_create();
-    rocksdb_options_set_create_if_missing(options, config.create_if_missing);
-    rocksdb_options_set_error_if_exists(options, config.error_if_exists);
-    rocksdb_options_set_paranoid_checks(options, config.paranoid_checks);
 
-    if (config.compression) {
-        rocksdb_options_set_compression(options, rocksdb_snappy_compression);
-    } else {
-        rocksdb_options_set_compression(options, rocksdb_no_compression);
-    }
+    // Create DB if missing - essential for first run when eviction tier doesn't exist yet
+    rocksdb_options_set_create_if_missing(options, 1);
 
-    rocksdb_options_set_write_buffer_size(options, config.write_buffer_size);
-    rocksdb_options_set_max_open_files(options, config.max_open_files);
+    // Don't error if exists - allows reusing existing eviction tier across restarts
+    rocksdb_options_set_error_if_exists(options, 0);
+
+    // Disable paranoid checks - trades some safety for better write performance in eviction path
+    rocksdb_options_set_paranoid_checks(options, 0);
+
+    // Enable Snappy compression - reduces disk usage for evicted data (2-4x compression typical)
+    rocksdb_options_set_compression(options, rocksdb_snappy_compression);
+
+    // Write buffer size - larger buffers reduce write amplification but use more memory
+    rocksdb_options_set_write_buffer_size(options, write_buffer_size);
+
+    // Max write buffers - allows 3 concurrent memtables for smoother write flow during bursts
+    rocksdb_options_set_max_write_buffer_number(options, 3);
+
+    // Max open files - limits file handles to prevent exhausting system resources
+    rocksdb_options_set_max_open_files(options, 1000);
+
+    // Optimize for point lookups - critical since we restore individual keys on cache miss
     rocksdb_options_optimize_for_point_lookup(options, 64);
+
+    // Enable mmap for reads - reduces system call overhead and improves read performance
     rocksdb_options_set_allow_mmap_reads(options, 1);
+
+    // Enable mmap for writes - improves write throughput during heavy eviction
     rocksdb_options_set_allow_mmap_writes(options, 1);
+
+    // Background compactions - limits to 2 threads to avoid CPU contention with Redis/Valkey
     rocksdb_options_set_max_background_compactions(options, 2);
+
+    // Dynamic level bytes - reduces space amplification by adjusting level sizes dynamically
     rocksdb_options_set_level_compaction_dynamic_level_bytes(options, 1);
 
+    // SST file size - 64MB strikes balance between compaction overhead and number of files
+    rocksdb_options_set_target_file_size_base(options, 64 * 1024 * 1024);
+
     rocksdb_block_based_table_options_t *table_options = rocksdb_block_based_options_create();
-    rocksdb_cache_t *cache = rocksdb_cache_create_lru(LRU_CACHE_SIZE);
+
+    // Block cache - crucial for read performance when restoring evicted keys
+    rocksdb_cache_t *cache = rocksdb_cache_create_lru(block_cache_size);
     rocksdb_block_based_options_set_block_cache(table_options, cache);
 
-    rocksdb_filterpolicy_t *filter_policy = rocksdb_filterpolicy_create_bloom(BLOOM_FILTER_BITS_PER_KEY);
+    // Bloom filter - reduces unnecessary disk reads by filtering out non-existent keys (10 bits = ~1% false positive rate)
+    rocksdb_filterpolicy_t *filter_policy = rocksdb_filterpolicy_create_bloom(10);
     rocksdb_block_based_options_set_filter_policy(table_options, filter_policy);
 
-    rocksdb_block_based_options_set_block_size(table_options, config.block_size);
-    rocksdb_block_based_options_set_block_restart_interval(table_options, config.block_restart_interval);
+    // Block size - 4KB matches typical filesystem/SSD page size for efficient I/O
+    rocksdb_block_based_options_set_block_size(table_options, 4 * 1024);
+
+    // Block restart interval - affects prefix compression (lower = better compression, higher = faster lookups)
+    rocksdb_block_based_options_set_block_restart_interval(table_options, 16);
+
+    // Cache index and filter blocks - keeps metadata in memory for faster lookups
     rocksdb_block_based_options_set_cache_index_and_filter_blocks(table_options, 1);
+
+    // Pin L0 filters in cache - L0 is most frequently accessed, pinning improves read latency
     rocksdb_block_based_options_set_pin_l0_filter_and_index_blocks_in_cache(table_options, 1);
 
     rocksdb_options_set_block_based_table_factory(options, table_options);
     rocksdb_block_based_options_destroy(table_options);
 
-    rocksdb_options_set_target_file_size_base(options, config.max_file_size);
-
-    db = rocksdb_open(options, config.db_path, &err);
+    db = rocksdb_open(options, config.path, &err);
     if (err != NULL) {
         ValkeyModule_Log(ctx, "warning", "infcache: failed to open RocksDB: %s", err);
         free(err);
         return VALKEYMODULE_ERR;
     }
-    LOG(ctx, "debug", "infcache: RocksDB opened successfully with TTL support");
+    ValkeyModule_Log(ctx, "notice", "infcache: RocksDB opened successfully (block_cache=%zuMB, write_buffer=%zuMB)",
+                     block_cache_size / (1024 * 1024), write_buffer_size / (1024 * 1024));
 
     roptions = rocksdb_readoptions_create();
+
+    // Disable checksum verification - trades some data integrity for faster reads on cache miss
     rocksdb_readoptions_set_verify_checksums(roptions, 0);
+
+    // Enable fill cache - ensures restored data gets cached for potential re-access
     rocksdb_readoptions_set_fill_cache(roptions, 1);
 
     woptions = rocksdb_writeoptions_create();
+
+    // Async writes - don't wait for fsync, improves eviction throughput (data in OS cache)
     rocksdb_writeoptions_set_sync(woptions, 0);
+
+    // Keep WAL enabled - provides crash recovery for evicted data (0 = WAL enabled)
     rocksdb_writeoptions_disable_WAL(woptions, 0);
 
     return VALKEYMODULE_OK;
@@ -198,9 +212,9 @@ void CleanupRocksDB(void) {
         rocksdb_writeoptions_destroy(woptions);
         woptions = NULL;
     }
-    if (config.db_path) {
-        free(config.db_path);
-        config.db_path = NULL;
+    if (config.path) {
+        free(config.path);
+        config.path = NULL;
     }
 }
 
@@ -577,6 +591,50 @@ int StatsCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     return VALKEYMODULE_OK;
 }
 
+// Helper function to get RocksDB property as integer
+static int64_t get_rocksdb_int_property(const char *property) {
+    if (!db) return -1;
+
+    char *value = rocksdb_property_value(db, property);
+    if (!value) return -1;
+
+    int64_t result = atoll(value);
+    free(value);
+    return result;
+}
+
+// Helper function to append formatted string to buffer
+static void append_info_line(char **buffer, size_t *size, size_t *capacity,
+                             const char *key, const char *value) {
+    size_t needed = strlen(key) + strlen(value) + 3; // key:value\r\n
+
+    while (*size + needed >= *capacity) {
+        *capacity *= 2;
+        *buffer = realloc(*buffer, *capacity);
+    }
+
+    *size += sprintf(*buffer + *size, "%s:%s\r\n", key, value);
+}
+
+static void append_info_line_int(char **buffer, size_t *size, size_t *capacity,
+                                 const char *key, int64_t value) {
+    char value_str[32];
+    snprintf(value_str, sizeof(value_str), "%lld", (long long)value);
+    append_info_line(buffer, size, capacity, key, value_str);
+}
+
+static void append_info_section(char **buffer, size_t *size, size_t *capacity,
+                                const char *section_name) {
+    size_t needed = strlen(section_name) + 4; // # section\r\n
+
+    while (*size + needed >= *capacity) {
+        *capacity *= 2;
+        *buffer = realloc(*buffer, *capacity);
+    }
+
+    *size += sprintf(*buffer + *size, "# %s\r\n", section_name);
+}
+
 int InfoCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     VALKEYMODULE_NOT_USED(argv);
     VALKEYMODULE_NOT_USED(argc);
@@ -585,14 +643,138 @@ int InfoCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
         return ValkeyModule_ReplyWithError(ctx, ERR_DB_NOT_INIT);
     }
 
-    char *db_stats = rocksdb_property_value(db, "rocksdb.stats");
-
-    if (db_stats) {
-        ValkeyModule_ReplyWithVerbatimString(ctx, db_stats, strlen(db_stats));
-        free(db_stats);
-    } else {
-        ValkeyModule_ReplyWithSimpleString(ctx, "No stats available");
+    // Initialize buffer for formatted output
+    size_t capacity = 4096;
+    size_t size = 0;
+    char *buffer = malloc(capacity);
+    if (!buffer) {
+        return ValkeyModule_ReplyWithError(ctx, "ERR Out of memory");
     }
+
+    // Infcache section - our custom metrics
+    append_info_section(&buffer, &size, &capacity, "Infcache");
+    append_info_line_int(&buffer, &size, &capacity, "keys_stored", stats.keys_stored);
+    append_info_line_int(&buffer, &size, &capacity, "keys_restored", stats.keys_restored);
+    append_info_line_int(&buffer, &size, &capacity, "keys_expired", stats.keys_expired);
+    append_info_line_int(&buffer, &size, &capacity, "keys_cleaned", stats.keys_cleaned);
+    append_info_line_int(&buffer, &size, &capacity, "bytes_written", stats.bytes_written);
+    append_info_line_int(&buffer, &size, &capacity, "bytes_read", stats.bytes_read);
+    append_info_line(&buffer, &size, &capacity, "path", config.path);
+
+    char max_mem_str[64];
+    snprintf(max_mem_str, sizeof(max_mem_str), "%zu (%zuMB)",
+             config.max_memory, config.max_memory / (1024 * 1024));
+    append_info_line(&buffer, &size, &capacity, "max_memory", max_mem_str);
+
+    // RocksDB Memory section
+    append_info_section(&buffer, &size, &capacity, "RocksDB_Memory");
+
+    int64_t block_cache_usage = get_rocksdb_int_property("rocksdb.block-cache-usage");
+    if (block_cache_usage >= 0) {
+        char usage_str[64];
+        snprintf(usage_str, sizeof(usage_str), "%lld (%lldMB)",
+                 (long long)block_cache_usage, (long long)(block_cache_usage / (1024 * 1024)));
+        append_info_line(&buffer, &size, &capacity, "block_cache_usage", usage_str);
+    }
+
+    int64_t block_cache_pinned = get_rocksdb_int_property("rocksdb.block-cache-pinned-usage");
+    if (block_cache_pinned >= 0) {
+        char pinned_str[64];
+        snprintf(pinned_str, sizeof(pinned_str), "%lld (%lldMB)",
+                 (long long)block_cache_pinned, (long long)(block_cache_pinned / (1024 * 1024)));
+        append_info_line(&buffer, &size, &capacity, "block_cache_pinned_usage", pinned_str);
+    }
+
+    int64_t memtable_size = get_rocksdb_int_property("rocksdb.cur-size-all-mem-tables");
+    if (memtable_size >= 0) {
+        char mem_str[64];
+        snprintf(mem_str, sizeof(mem_str), "%lld (%lldMB)",
+                 (long long)memtable_size, (long long)(memtable_size / (1024 * 1024)));
+        append_info_line(&buffer, &size, &capacity, "memtable_size", mem_str);
+    }
+
+    int64_t table_readers_mem = get_rocksdb_int_property("rocksdb.estimate-table-readers-mem");
+    if (table_readers_mem >= 0) {
+        char readers_str[64];
+        snprintf(readers_str, sizeof(readers_str), "%lld (%lldMB)",
+                 (long long)table_readers_mem, (long long)(table_readers_mem / (1024 * 1024)));
+        append_info_line(&buffer, &size, &capacity, "table_readers_mem", readers_str);
+    }
+
+    // RocksDB Storage section
+    append_info_section(&buffer, &size, &capacity, "RocksDB_Storage");
+
+    int64_t num_keys = get_rocksdb_int_property("rocksdb.estimate-num-keys");
+    if (num_keys >= 0) {
+        append_info_line_int(&buffer, &size, &capacity, "estimated_keys", num_keys);
+    }
+
+    int64_t live_data_size = get_rocksdb_int_property("rocksdb.estimate-live-data-size");
+    if (live_data_size >= 0) {
+        char size_str[64];
+        snprintf(size_str, sizeof(size_str), "%lld (%lldMB)",
+                 (long long)live_data_size, (long long)(live_data_size / (1024 * 1024)));
+        append_info_line(&buffer, &size, &capacity, "live_data_size", size_str);
+    }
+
+    int64_t total_sst_size = get_rocksdb_int_property("rocksdb.total-sst-files-size");
+    if (total_sst_size >= 0) {
+        char sst_str[64];
+        snprintf(sst_str, sizeof(sst_str), "%lld (%lldMB)",
+                 (long long)total_sst_size, (long long)(total_sst_size / (1024 * 1024)));
+        append_info_line(&buffer, &size, &capacity, "total_sst_files_size", sst_str);
+    }
+
+    int64_t num_snapshots = get_rocksdb_int_property("rocksdb.num-snapshots");
+    if (num_snapshots >= 0) {
+        append_info_line_int(&buffer, &size, &capacity, "num_snapshots", num_snapshots);
+    }
+
+    // RocksDB Compaction section
+    append_info_section(&buffer, &size, &capacity, "RocksDB_Compaction");
+
+    int64_t num_immutable = get_rocksdb_int_property("rocksdb.num-immutable-mem-table");
+    if (num_immutable >= 0) {
+        append_info_line_int(&buffer, &size, &capacity, "num_immutable_memtables", num_immutable);
+    }
+
+    int64_t flush_pending = get_rocksdb_int_property("rocksdb.mem-table-flush-pending");
+    if (flush_pending >= 0) {
+        append_info_line(&buffer, &size, &capacity, "memtable_flush_pending",
+                        flush_pending ? "yes" : "no");
+    }
+
+    int64_t compaction_pending = get_rocksdb_int_property("rocksdb.compaction-pending");
+    if (compaction_pending >= 0) {
+        append_info_line(&buffer, &size, &capacity, "compaction_pending",
+                        compaction_pending ? "yes" : "no");
+    }
+
+    int64_t bg_errors = get_rocksdb_int_property("rocksdb.background-errors");
+    if (bg_errors >= 0) {
+        append_info_line_int(&buffer, &size, &capacity, "background_errors", bg_errors);
+    }
+
+    int64_t base_level = get_rocksdb_int_property("rocksdb.base-level");
+    if (base_level >= 0) {
+        append_info_line_int(&buffer, &size, &capacity, "base_level", base_level);
+    }
+
+    // Get level file counts (L0-L6 are common)
+    for (int level = 0; level <= 6; level++) {
+        char property[64];
+        snprintf(property, sizeof(property), "rocksdb.num-files-at-level%d", level);
+        int64_t num_files = get_rocksdb_int_property(property);
+        if (num_files >= 0) {
+            char key[32];
+            snprintf(key, sizeof(key), "num_files_L%d", level);
+            append_info_line_int(&buffer, &size, &capacity, key, num_files);
+        }
+    }
+
+    // Reply with formatted output
+    ValkeyModule_ReplyWithVerbatimString(ctx, buffer, size);
+    free(buffer);
 
     return VALKEYMODULE_OK;
 }
@@ -645,7 +827,8 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
         return VALKEYMODULE_ERR;
     }
 
-    ValkeyModule_Log(ctx, "notice", "infcache: module loaded successfully, db_path=%s", config.db_path);
+    ValkeyModule_Log(ctx, "notice", "infcache: module loaded successfully, path=%s, max_memory=%zuMB",
+                     config.path, config.max_memory / (1024 * 1024));
 
     return VALKEYMODULE_OK;
 }

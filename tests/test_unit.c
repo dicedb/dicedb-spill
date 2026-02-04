@@ -517,16 +517,8 @@ TEST(time_precision_validation) {
 
 // Test configuration parsing logic (mock implementation)
 typedef struct {
-    char *db_path;
-    int create_if_missing;
-    int error_if_exists;
-    int paranoid_checks;
-    int compression;
-    size_t write_buffer_size;
-    int max_open_files;
-    size_t block_size;
-    int block_restart_interval;
-    size_t max_file_size;
+    char *path;
+    size_t max_memory;
 } MockConfig;
 
 static MockConfig mock_config = {0};
@@ -539,79 +531,83 @@ static void mock_parse_args(const char **args, int count) {
         const char *value = args[i + 1];
 
         if (strcmp(key, "path") == 0) {
-            if (mock_config.db_path) free(mock_config.db_path);
-            mock_config.db_path = strdup(value);
-        } else if (strcmp(key, "compression") == 0) {
-            mock_config.compression = atoi(value);
-        } else if (strcmp(key, "write_buffer_size") == 0) {
-            mock_config.write_buffer_size = (size_t)atoll(value);
+            if (mock_config.path) free(mock_config.path);
+            mock_config.path = strdup(value);
+        } else if (strcmp(key, "max-memory") == 0 || strcmp(key, "max_memory") == 0) {
+            mock_config.max_memory = (size_t)atoll(value);
+            if (mock_config.max_memory < 64 * 1024 * 1024) {
+                mock_config.max_memory = 64 * 1024 * 1024;
+            }
         }
     }
 
-    if (!mock_config.db_path) {
-        mock_config.db_path = strdup("/tmp/dicedb-l2");
+    if (!mock_config.path) {
+        mock_config.path = strdup("/tmp/dicedb-l2");
+    }
+    if (mock_config.max_memory == 0) {
+        mock_config.max_memory = 256 * 1024 * 1024;  // Default 256MB
     }
 }
 
 TEST(config_parsing_basic) {
     // Reset config
-    if (mock_config.db_path) {
-        free(mock_config.db_path);
-        mock_config.db_path = NULL;
+    if (mock_config.path) {
+        free(mock_config.path);
+        mock_config.path = NULL;
     }
     memset(&mock_config, 0, sizeof(mock_config));
 
     // Test basic parsing
-    const char *args[] = {"path", "/custom/path", "compression", "1"};
+    const char *args[] = {"path", "/custom/path", "max-memory", "134217728"};
     mock_parse_args(args, 4);
 
-    assert(strcmp(mock_config.db_path, "/custom/path") == 0);
-    assert(mock_config.compression == 1);
+    assert(strcmp(mock_config.path, "/custom/path") == 0);
+    assert(mock_config.max_memory == 134217728);  // 128MB
 
-    free(mock_config.db_path);
-    mock_config.db_path = NULL;
+    free(mock_config.path);
+    mock_config.path = NULL;
 }
 
 TEST(config_parsing_defaults) {
     // Reset config
-    if (mock_config.db_path) {
-        free(mock_config.db_path);
-        mock_config.db_path = NULL;
+    if (mock_config.path) {
+        free(mock_config.path);
+        mock_config.path = NULL;
     }
     memset(&mock_config, 0, sizeof(mock_config));
 
-    // Test default path assignment
-    const char *args[] = {"compression", "0"};
-    mock_parse_args(args, 2);
+    // Test default path and memory assignment
+    const char *args[] = {};
+    mock_parse_args(args, 0);
 
-    assert(strcmp(mock_config.db_path, "/tmp/dicedb-l2") == 0);
-    assert(mock_config.compression == 0);
+    assert(strcmp(mock_config.path, "/tmp/dicedb-l2") == 0);
+    assert(mock_config.max_memory == 256 * 1024 * 1024);  // Default 256MB
 
-    free(mock_config.db_path);
-    mock_config.db_path = NULL;
+    free(mock_config.path);
+    mock_config.path = NULL;
 }
 
 TEST(config_parsing_numeric_values) {
     // Reset config
-    if (mock_config.db_path) {
-        free(mock_config.db_path);
-        mock_config.db_path = NULL;
+    if (mock_config.path) {
+        free(mock_config.path);
+        mock_config.path = NULL;
     }
     memset(&mock_config, 0, sizeof(mock_config));
 
-    // Test numeric value parsing
+    // Test numeric value parsing with minimum enforcement
     const char *args[] = {
-        "write_buffer_size", "67108864",
-        "compression", "1"
+        "max-memory", "1000",  // Too low, should be clamped to 64MB
+        "path", "/test/path"
     };
     mock_parse_args(args, 4);
 
-    assert(mock_config.write_buffer_size == 67108864);
-    assert(mock_config.compression == 1);
+    assert(mock_config.max_memory == 64 * 1024 * 1024);  // Should be clamped to 64MB minimum
+    assert(strcmp(mock_config.path, "/test/path") == 0);
 
-    if (mock_config.db_path) {
-        free(mock_config.db_path);
-        mock_config.db_path = NULL;
+    if (mock_config.path) {
+        free(mock_config.path);
+        mock_config.path = NULL;
     }
 }
 
