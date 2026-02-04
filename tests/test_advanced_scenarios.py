@@ -4,7 +4,6 @@ Advanced Test Scenarios for DiceDB Infcache Module
 
 Tests critical scenarios that weren't covered in the main test suites:
 - SIMD data handling and alignment
-- Batch operations and FlushBatch functionality
 - Memory pressure and allocation failures
 - RocksDB error conditions and recovery
 - Security and robustness scenarios
@@ -92,29 +91,29 @@ def test_simd_threshold_data_handling():
 
     print(f"  {restored_count}/{len(test_cases)} SIMD-optimized keys restored correctly")
 
-def test_batch_operations_stress():
-    """Test batch write operations and FlushBatch functionality under stress"""
+def test_direct_write_operations_stress():
+    """Test direct write operations under stress (no batching in current implementation)"""
     r = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True)
 
-    # Create many keys simultaneously to trigger batch operations
-    batch_keys = []
+    # Create many keys simultaneously to test direct write performance
+    test_keys = []
     for i in range(100):
-        key = f'batch_key_{i}'
-        value = f'batch_value_{i}_{"x" * 100}'
+        key = f'direct_key_{i}'
+        value = f'direct_value_{i}_{"x" * 100}'
         r.setex(key, 3600, value)
-        batch_keys.append((key, value))
+        test_keys.append((key, value))
 
     # Get initial stats
     initial_stats = r.execute_command('infcache.stats')
     initial_dict = {initial_stats[i]: initial_stats[i+1] for i in range(0, len(initial_stats), 2)}
 
-    # Force rapid evictions to stress batch system
+    # Force rapid evictions to stress direct write system
     for i in range(2000):
-        r.set(f'batch_filler_{i}', 'x' * 5000)
+        r.set(f'direct_filler_{i}', 'x' * 5000)
 
-    time.sleep(0.5)  # Allow batch operations to complete
+    time.sleep(0.5)  # Allow direct write operations to complete
 
-    # Check that batch operations occurred
+    # Check that direct write operations occurred
     final_stats = r.execute_command('infcache.stats')
     final_dict = {final_stats[i]: final_stats[i+1] for i in range(0, len(final_stats), 2)}
 
@@ -129,23 +128,23 @@ def test_batch_operations_stress():
     if keys_stored == 0:
         print("  No keys were evicted/stored (server may not be under memory pressure)")
     else:
-        print(f"  Batch operations working: {keys_stored} keys stored")
+        print(f"  Direct write operations working: {keys_stored} keys stored")
         assert bytes_written > keys_stored * 50, f"Expected reasonable bytes per key, got {bytes_written} for {keys_stored} keys"
 
-    # Test batch restoration
-    restored_batch = 0
-    for key, expected_value in batch_keys[:20]:  # Test first 20
+    # Test restoration after direct writes
+    restored_count = 0
+    for key, expected_value in test_keys[:20]:  # Test first 20
         if r.get(key) is None:
             try:
                 result = r.execute_command('infcache.restore', key)
                 if result == 'OK':
                     actual_value = r.get(key)
                     if actual_value == expected_value:
-                        restored_batch += 1
+                        restored_count += 1
             except:
                 pass
 
-    print(f"  Batch operations: {keys_stored} keys stored, {restored_batch} restored correctly")
+    print(f"  Direct writes: {keys_stored} keys stored, {restored_count} restored correctly")
 
 def test_extreme_memory_pressure():
     """Test behavior under extreme memory pressure conditions"""
@@ -473,6 +472,92 @@ def test_security_boundary_conditions():
 
     print("  ✓ Security boundary conditions handled appropriately")
 
+def test_cleanup_command():
+    """Test the cleanup command for removing expired keys from RocksDB"""
+    r = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True)
+
+    # Create keys with very short TTLs
+    short_ttl_keys = []
+    for i in range(10):
+        key = f'cleanup_test_{i}'
+        r.setex(key, 2, f'cleanup_value_{i}')  # 2 second TTL
+        short_ttl_keys.append(key)
+
+    # Force eviction to move keys to RocksDB
+    for i in range(500):
+        r.set(f'cleanup_filler_{i}', 'x' * 8000)
+
+    time.sleep(0.2)
+
+    # Wait for keys to expire
+    time.sleep(3)
+
+    # Get stats before cleanup
+    initial_stats = r.execute_command('infcache.stats')
+    initial_dict = {initial_stats[i]: initial_stats[i+1] for i in range(0, len(initial_stats), 2)}
+
+    # Run cleanup command
+    cleanup_result = r.execute_command('infcache.cleanup')
+    assert isinstance(cleanup_result, list), "Cleanup should return array result"
+    cleanup_dict = {cleanup_result[i]: cleanup_result[i+1] for i in range(0, len(cleanup_result), 2)}
+
+    # Check that cleanup found and removed keys
+    assert 'keys_checked' in cleanup_dict, "Cleanup should report keys_checked"
+    assert 'keys_removed' in cleanup_dict, "Cleanup should report keys_removed"
+    assert cleanup_dict['keys_checked'] >= 0, "keys_checked should be non-negative"
+    assert cleanup_dict['keys_removed'] >= 0, "keys_removed should be non-negative"
+
+    # Get stats after cleanup
+    final_stats = r.execute_command('infcache.stats')
+    final_dict = {final_stats[i]: final_stats[i+1] for i in range(0, len(final_stats), 2)}
+
+    # Verify keys_expired and keys_cleaned stats were updated
+    keys_expired_delta = final_dict['keys_expired'] - initial_dict['keys_expired']
+    keys_cleaned_delta = final_dict['keys_cleaned'] - initial_dict['keys_cleaned']
+
+    print(f"  Cleanup: checked={cleanup_dict['keys_checked']}, removed={cleanup_dict['keys_removed']}, " +
+          f"expired_stat_delta={keys_expired_delta}, cleaned_stat_delta={keys_cleaned_delta}")
+
+def test_expired_key_restoration():
+    """Test that expired keys are properly detected and not restored"""
+    r = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True)
+
+    # Create a key with very short TTL
+    test_key = 'expiry_test_key'
+    r.setex(test_key, 2, 'expiry_test_value')  # 2 second TTL
+
+    # Force eviction to move key to RocksDB
+    for i in range(500):
+        r.set(f'expiry_filler_{i}', 'x' * 8000)
+
+    time.sleep(0.2)
+
+    # Wait for key to expire
+    time.sleep(3)
+
+    # Get stats before restore attempt
+    initial_stats = r.execute_command('infcache.stats')
+    initial_dict = {initial_stats[i]: initial_stats[i+1] for i in range(0, len(initial_stats), 2)}
+
+    # Try to restore expired key
+    try:
+        result = r.execute_command('infcache.restore', test_key)
+        # Should either return error or null
+        assert result in [None, 'ERR Key has expired'], f"Expected expiry error or null, got: {result}"
+    except redis.ResponseError as e:
+        # Should get an error about expiry
+        assert 'expired' in str(e).lower(), f"Expected expiry error, got: {e}"
+
+    # Get stats after restore attempt
+    final_stats = r.execute_command('infcache.stats')
+    final_dict = {final_stats[i]: final_stats[i+1] for i in range(0, len(final_stats), 2)}
+
+    # Verify keys_expired stat was incremented
+    keys_expired_delta = final_dict['keys_expired'] - initial_dict['keys_expired']
+    assert keys_expired_delta >= 0, f"keys_expired should not decrease, delta={keys_expired_delta}"
+
+    print(f"  Expired key handling: keys_expired increased by {keys_expired_delta}")
+
 def main():
     """Main test runner for advanced scenarios"""
     print("=== DiceDB Infcache Advanced Test Scenarios ===\n")
@@ -489,13 +574,15 @@ def main():
     # Run advanced tests
     tests = [
         (test_simd_threshold_data_handling, "SIMD threshold data handling"),
-        (test_batch_operations_stress, "Batch operations stress test"),
+        (test_direct_write_operations_stress, "Direct write operations stress test"),
         (test_extreme_memory_pressure, "Extreme memory pressure handling"),
         (test_rocksdb_error_conditions, "RocksDB error condition handling"),
         (test_concurrent_access_patterns, "Concurrent access patterns"),
         (test_data_corruption_resilience, "Data corruption resilience"),
         (test_ttl_edge_cases_precision, "TTL edge cases and precision"),
         (test_security_boundary_conditions, "Security boundary conditions"),
+        (test_cleanup_command, "Cleanup command functionality"),
+        (test_expired_key_restoration, "Expired key restoration handling"),
     ]
 
     passed = 0

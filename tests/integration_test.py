@@ -101,10 +101,19 @@ class InfcacheIntegrationTest(unittest.TestCase):
 
     def test_infcache_cleanup_command(self):
         """Test infcache.cleanup command"""
-        # Should return number of cleaned keys (initially 0)
-        cleaned = self.client.execute_command('infcache.cleanup')
-        self.assertIsInstance(cleaned, int)
-        self.assertGreaterEqual(cleaned, 0)
+        # Should return array with keys_checked and keys_removed
+        result = self.client.execute_command('infcache.cleanup')
+        self.assertIsInstance(result, list)
+        self.assertEqual(len(result), 4)
+
+        # Convert to dict for easier testing
+        result_dict = {result[i]: result[i+1] for i in range(0, len(result), 2)}
+        self.assertIn('keys_checked', result_dict)
+        self.assertIn('keys_removed', result_dict)
+        self.assertIsInstance(result_dict['keys_checked'], int)
+        self.assertIsInstance(result_dict['keys_removed'], int)
+        self.assertGreaterEqual(result_dict['keys_checked'], 0)
+        self.assertGreaterEqual(result_dict['keys_removed'], 0)
 
     def test_basic_key_eviction_and_storage(self):
         """Test manual key storage functionality (DiceDB doesn't auto-evict)"""
@@ -171,9 +180,18 @@ class InfcacheIntegrationTest(unittest.TestCase):
     def test_cleanup_expired_keys(self):
         """Test cleanup command functionality"""
         # Test the cleanup command exists and works
-        cleaned = self.client.execute_command('infcache.cleanup')
-        self.assertIsInstance(cleaned, int)
-        self.assertGreaterEqual(cleaned, 0)
+        result = self.client.execute_command('infcache.cleanup')
+        self.assertIsInstance(result, list)
+        self.assertEqual(len(result), 4)
+
+        # Convert to dict for easier testing
+        result_dict = {result[i]: result[i+1] for i in range(0, len(result), 2)}
+        self.assertIn('keys_checked', result_dict)
+        self.assertIn('keys_removed', result_dict)
+        self.assertIsInstance(result_dict['keys_checked'], int)
+        self.assertIsInstance(result_dict['keys_removed'], int)
+        self.assertGreaterEqual(result_dict['keys_checked'], 0)
+        self.assertGreaterEqual(result_dict['keys_removed'], 0)
 
         # Verify stats are accessible
         stats = self.client.execute_command('infcache.stats')
