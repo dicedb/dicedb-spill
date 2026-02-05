@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-DiceDB Infcache Module Integration Tests
+DiceDB Spill Module Integration Tests
 
-This test suite provides comprehensive integration testing for the DiceDB infcache module,
+This test suite provides comprehensive integration testing for the DiceDB spill module,
 covering all functionality including key eviction, restoration, TTL handling, and edge cases.
 """
 
@@ -17,8 +17,8 @@ import random
 import string
 
 
-class InfcacheIntegrationTest(unittest.TestCase):
-    """Integration tests for DiceDB infcache module"""
+class SpillIntegrationTest(unittest.TestCase):
+    """Integration tests for DiceDB spill module"""
 
     @classmethod
     def setUpClass(cls):
@@ -65,19 +65,19 @@ class InfcacheIntegrationTest(unittest.TestCase):
         time.sleep(0.1)
 
     def test_module_loaded(self):
-        """Test that infcache module is loaded and commands are available"""
-        # Check if infcache commands exist by trying to call them
+        """Test that spill module is loaded and commands are available"""
+        # Check if spill commands exist by trying to call them
         try:
             # This should return stats or an error, but not "unknown command"
-            result = self.client.execute_command('infcache.stats')
+            result = self.client.execute_command('spill.stats')
             self.assertIsInstance(result, list)
         except redis.ResponseError as e:
             if 'unknown command' in str(e).lower():
-                self.fail("Infcache module not loaded - infcache.stats command not found")
+                self.fail("Spill module not loaded - spill.stats command not found")
 
-    def test_infcache_stats_command(self):
-        """Test infcache.stats command returns proper statistics"""
-        stats = self.client.execute_command('infcache.stats')
+    def test_spill_stats_command(self):
+        """Test spill.stats command returns proper statistics"""
+        stats = self.client.execute_command('spill.stats')
 
         # Should return array with key-value pairs
         self.assertIsInstance(stats, list)
@@ -92,17 +92,17 @@ class InfcacheIntegrationTest(unittest.TestCase):
             self.assertIn(key, stats_dict, f"Missing stat: {key}")
             self.assertIsInstance(stats_dict[key], int, f"Stat {key} should be integer")
 
-    def test_infcache_info_command(self):
-        """Test infcache.info command returns RocksDB information"""
-        info = self.client.execute_command('infcache.info')
+    def test_spill_info_command(self):
+        """Test spill.info command returns RocksDB information"""
+        info = self.client.execute_command('spill.info')
         self.assertIsInstance(info, str)
         # Should contain some RocksDB statistics
         self.assertTrue(len(info) > 0, "Info should not be empty")
 
-    def test_infcache_cleanup_command(self):
-        """Test infcache.cleanup command"""
+    def test_spill_cleanup_command(self):
+        """Test spill.cleanup command"""
         # Should return array with keys_checked and keys_removed
-        result = self.client.execute_command('infcache.cleanup')
+        result = self.client.execute_command('spill.cleanup')
         self.assertIsInstance(result, list)
         self.assertEqual(len(result), 4)
 
@@ -124,7 +124,7 @@ class InfcacheIntegrationTest(unittest.TestCase):
         self.client.setex('test_key', 3600, 'test_value')
 
         # Get initial stats
-        initial_stats = self.client.execute_command('infcache.stats')
+        initial_stats = self.client.execute_command('spill.stats')
         initial_dict = {initial_stats[i]: initial_stats[i+1] for i in range(0, len(initial_stats), 2)}
 
         # Since automatic eviction doesn't work in DiceDB, we'll just verify
@@ -133,15 +133,15 @@ class InfcacheIntegrationTest(unittest.TestCase):
         self.assertIsInstance(initial_dict['keys_restored'], int)
 
     def test_manual_key_restoration(self):
-        """Test manual key restoration using infcache.restore"""
+        """Test manual key restoration using spill.restore"""
         # Since DiceDB doesn't auto-evict, we'll test the restore command
         # on a non-existent key (which should return an appropriate response)
 
         # Try to restore a key that doesn't exist
-        restore_result = self.client.execute_command('infcache.restore', 'nonexistent_key')
+        restore_result = self.client.execute_command('spill.restore', 'nonexistent_key')
 
         # The command should execute without error (returns None for non-existent keys)
-        # This tests that the infcache.restore command is available and working
+        # This tests that the spill.restore command is available and working
         self.assertIsNone(restore_result)
 
     def test_automatic_key_restoration_on_access(self):
@@ -173,14 +173,14 @@ class InfcacheIntegrationTest(unittest.TestCase):
         self.assertIsNone(self.client.get('expire_test'))
 
         # Try to restore expired key (should handle gracefully)
-        result = self.client.execute_command('infcache.restore', 'expire_test')
+        result = self.client.execute_command('spill.restore', 'expire_test')
         # The command should execute without crashing (returns None for expired/non-existent keys)
         self.assertIsNone(result)
 
     def test_cleanup_expired_keys(self):
         """Test cleanup command functionality"""
         # Test the cleanup command exists and works
-        result = self.client.execute_command('infcache.cleanup')
+        result = self.client.execute_command('spill.cleanup')
         self.assertIsInstance(result, list)
         self.assertEqual(len(result), 4)
 
@@ -194,7 +194,7 @@ class InfcacheIntegrationTest(unittest.TestCase):
         self.assertGreaterEqual(result_dict['keys_removed'], 0)
 
         # Verify stats are accessible
-        stats = self.client.execute_command('infcache.stats')
+        stats = self.client.execute_command('spill.stats')
         stats_dict = {stats[i]: stats[i+1] for i in range(0, len(stats), 2)}
         self.assertIsInstance(stats_dict['keys_expired'], int)
 
@@ -208,7 +208,7 @@ class InfcacheIntegrationTest(unittest.TestCase):
         self.assertEqual(self.client.ttl('no_ttl_key'), -1)  # -1 means no expiration
 
         # Test restore command on existing key (returns None since key wasn't evicted)
-        result = self.client.execute_command('infcache.restore', 'no_ttl_key')
+        result = self.client.execute_command('spill.restore', 'no_ttl_key')
         # Command should execute without error (None is expected for non-evicted keys)
         self.assertTrue(result is None or isinstance(result, str))
 
@@ -224,7 +224,7 @@ class InfcacheIntegrationTest(unittest.TestCase):
         self.assertEqual(len(retrieved_value), 100000)
 
         # Test restore command on existing large key
-        result = self.client.execute_command('infcache.restore', 'large_test_key')
+        result = self.client.execute_command('spill.restore', 'large_test_key')
         # Command should execute without error (None is expected for non-evicted keys)
         self.assertTrue(result is None or isinstance(result, str))
 
@@ -241,20 +241,20 @@ class InfcacheIntegrationTest(unittest.TestCase):
         self.assertEqual(retrieved_value, unicode_value)
 
         # Test restore command on Unicode key
-        result = self.client.execute_command('infcache.restore', unicode_key)
+        result = self.client.execute_command('spill.restore', unicode_key)
         # Command should execute without error (None is expected for non-evicted keys)
         self.assertTrue(result is None or isinstance(result, str))
 
     def test_nonexistent_key_restore(self):
         """Test restoring a key that doesn't exist in RocksDB"""
-        result = self.client.execute_command('infcache.restore', 'nonexistent_key')
+        result = self.client.execute_command('spill.restore', 'nonexistent_key')
         self.assertIsNone(result)
 
     def test_empty_key_handling(self):
         """Test handling of edge cases with empty or invalid keys"""
         # Test empty key
         try:
-            result = self.client.execute_command('infcache.restore', '')
+            result = self.client.execute_command('spill.restore', '')
             # Should handle gracefully
         except redis.ResponseError as e:
             # Error is acceptable for empty key
@@ -277,8 +277,8 @@ class InfcacheIntegrationTest(unittest.TestCase):
                     value = f'value_{thread_id}_{i}'
                     client.setex(key, 3600, value)
 
-                # Test infcache stats command
-                stats = client.execute_command('infcache.stats')
+                # Test spill stats command
+                stats = client.execute_command('spill.stats')
                 time.sleep(0.1)
 
                 # Try to call restore commands (won't restore but tests the command)
@@ -286,7 +286,7 @@ class InfcacheIntegrationTest(unittest.TestCase):
                 for i in range(num_keys_per_thread):
                     key = f'concurrent_test_{thread_id}_{i}'
                     try:
-                        result = client.execute_command('infcache.restore', key)
+                        result = client.execute_command('spill.restore', key)
                         # Just count that command executed without error
                         restored_count += 1
                     except Exception as e:
@@ -336,7 +336,7 @@ class InfcacheIntegrationTest(unittest.TestCase):
                 self.assertEqual(retrieved_value, value)
 
                 # Test restore command (returns None for non-evicted keys)
-                result = self.client.execute_command('infcache.restore', key)
+                result = self.client.execute_command('spill.restore', key)
                 self.assertTrue(result is None or isinstance(result, str))
 
                 # Clean up
@@ -354,7 +354,7 @@ class InfcacheIntegrationTest(unittest.TestCase):
             self.client.setex(key, 3600, value)
 
         # Check initial stats
-        stats = self.client.execute_command('infcache.stats')
+        stats = self.client.execute_command('spill.stats')
         stats_dict = {stats[i]: stats[i+1] for i in range(0, len(stats), 2)}
         initial_stored = stats_dict['keys_stored']
 
@@ -363,7 +363,7 @@ class InfcacheIntegrationTest(unittest.TestCase):
         for i in range(num_keys):
             key = f'{key_prefix}_{i}'
             try:
-                result = self.client.execute_command('infcache.restore', key)
+                result = self.client.execute_command('spill.restore', key)
                 command_count += 1  # Count successful command executions
                 # Verify original key still exists
                 expected_value = f'value_{i}_{"x" * 1000}'
@@ -391,7 +391,7 @@ class InfcacheIntegrationTest(unittest.TestCase):
 
         # The short TTL key might expire during eviction, that's okay
         # Test long TTL key restoration
-        result = self.client.execute_command('infcache.restore', 'long_ttl')
+        result = self.client.execute_command('spill.restore', 'long_ttl')
         if result == 'OK':
             ttl = self.client.ttl('long_ttl')
             self.assertGreater(ttl, 86300)  # Should still have most of its TTL
@@ -401,13 +401,13 @@ class InfcacheIntegrationTest(unittest.TestCase):
         """Test various error conditions and edge cases"""
         # Test restore with wrong number of arguments
         try:
-            self.client.execute_command('infcache.restore')
+            self.client.execute_command('spill.restore')
             self.fail("Should raise error for wrong arity")
         except redis.ResponseError:
             pass
 
         try:
-            self.client.execute_command('infcache.restore', 'key1', 'key2')
+            self.client.execute_command('spill.restore', 'key1', 'key2')
             self.fail("Should raise error for wrong arity")
         except redis.ResponseError:
             pass
@@ -415,7 +415,7 @@ class InfcacheIntegrationTest(unittest.TestCase):
     def test_statistics_accuracy(self):
         """Test that statistics are accessible and properly formatted"""
         # Get initial stats
-        initial_stats = self.client.execute_command('infcache.stats')
+        initial_stats = self.client.execute_command('spill.stats')
         initial_dict = {initial_stats[i]: initial_stats[i+1] for i in range(0, len(initial_stats), 2)}
 
         # Verify required stat fields exist and are integers
@@ -429,11 +429,11 @@ class InfcacheIntegrationTest(unittest.TestCase):
         self.client.setex('stats_test_2', 3600, 'value2')
 
         # Test restore commands
-        result1 = self.client.execute_command('infcache.restore', 'stats_test_1')
-        result2 = self.client.execute_command('infcache.restore', 'nonexistent_key')
+        result1 = self.client.execute_command('spill.restore', 'stats_test_1')
+        result2 = self.client.execute_command('spill.restore', 'nonexistent_key')
 
         # Get final stats
-        final_stats = self.client.execute_command('infcache.stats')
+        final_stats = self.client.execute_command('spill.stats')
         final_dict = {final_stats[i]: final_stats[i+1] for i in range(0, len(final_stats), 2)}
 
         # Verify stats are still properly formatted
@@ -444,7 +444,7 @@ class InfcacheIntegrationTest(unittest.TestCase):
 
 def run_tests():
     """Run all tests with proper setup and reporting"""
-    print("Starting DiceDB Infcache Module Integration Tests")
+    print("Starting DiceDB Spill Module Integration Tests")
     print("=" * 60)
 
     # Test connection first
@@ -456,21 +456,21 @@ def run_tests():
         print(f"✗ Failed to connect to DiceDB: {e}")
         return 1
 
-    # Check if infcache module is loaded
+    # Check if spill module is loaded
     try:
-        client.execute_command('infcache.stats')
-        print("✓ Infcache module detected")
+        client.execute_command('spill.stats')
+        print("✓ Spill module detected")
     except redis.ResponseError as e:
         if 'unknown command' in str(e).lower():
-            print("✗ Infcache module not loaded")
-            print("Please load the module: --loadmodule ./lib-infcache.so")
+            print("✗ Spill module not loaded")
+            print("Please load the module: --loadmodule ./lib-spill.so")
             return 1
 
     print()
 
     # Create test suite
     loader = unittest.TestLoader()
-    suite = loader.loadTestsFromTestCase(InfcacheIntegrationTest)
+    suite = loader.loadTestsFromTestCase(SpillIntegrationTest)
 
     # Run tests with verbose output
     runner = unittest.TextTestRunner(verbosity=2, stream=sys.stdout)

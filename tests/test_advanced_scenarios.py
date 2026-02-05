@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Advanced Test Scenarios for DiceDB Infcache Module
+Advanced Test Scenarios for DiceDB Spill Module
 
 Tests critical scenarios that weren't covered in the main test suites:
 - SIMD data handling and alignment
@@ -81,7 +81,7 @@ def test_simd_threshold_data_handling():
     for key, expected_data in test_cases:
         if r.get(key) is None:  # Key was evicted
             try:
-                result = r.execute_command('infcache.restore', key)
+                result = r.execute_command('spill.restore', key)
                 if result == b'OK':
                     restored_data = r.get(key)
                     assert restored_data == expected_data, f"SIMD data mismatch for {key}"
@@ -104,7 +104,7 @@ def test_direct_write_operations_stress():
         test_keys.append((key, value))
 
     # Get initial stats
-    initial_stats = r.execute_command('infcache.stats')
+    initial_stats = r.execute_command('spill.stats')
     initial_dict = {initial_stats[i]: initial_stats[i+1] for i in range(0, len(initial_stats), 2)}
 
     # Force rapid evictions to stress direct write system
@@ -114,7 +114,7 @@ def test_direct_write_operations_stress():
     time.sleep(0.5)  # Allow direct write operations to complete
 
     # Check that direct write operations occurred
-    final_stats = r.execute_command('infcache.stats')
+    final_stats = r.execute_command('spill.stats')
     final_dict = {final_stats[i]: final_stats[i+1] for i in range(0, len(final_stats), 2)}
 
     keys_stored = final_dict['keys_stored'] - initial_dict['keys_stored']
@@ -136,7 +136,7 @@ def test_direct_write_operations_stress():
     for key, expected_value in test_keys[:20]:  # Test first 20
         if r.get(key) is None:
             try:
-                result = r.execute_command('infcache.restore', key)
+                result = r.execute_command('spill.restore', key)
                 if result == 'OK':
                     actual_value = r.get(key)
                     if actual_value == expected_value:
@@ -208,7 +208,7 @@ def test_extreme_memory_pressure():
             return
 
         try:
-            result = r.execute_command('infcache.restore', 'pressure_key')
+            result = r.execute_command('spill.restore', 'pressure_key')
             if result == 'OK':
                 value = r.get('pressure_key')
                 if value == 'pressure_value':
@@ -240,10 +240,10 @@ def test_rocksdb_error_conditions():
 
     # Test 1: Commands when RocksDB might be unavailable
     error_commands = [
-        ('infcache.restore', ['nonexistent_key']),
-        ('infcache.cleanup', []),
-        ('infcache.info', []),
-        ('infcache.stats', [])
+        ('spill.restore', ['nonexistent_key']),
+        ('spill.cleanup', []),
+        ('spill.info', []),
+        ('spill.stats', [])
     ]
 
     for cmd, args in error_commands:
@@ -261,7 +261,7 @@ def test_rocksdb_error_conditions():
     # Test 2: Very long key names (test bounds checking)
     long_key = 'x' * 10000  # 10KB key name
     try:
-        result = r.execute_command('infcache.restore', long_key)
+        result = r.execute_command('spill.restore', long_key)
         # Should handle gracefully
         assert result is None or isinstance(result, str)
     except redis.ResponseError:
@@ -270,7 +270,7 @@ def test_rocksdb_error_conditions():
     # Test 3: Binary data with null bytes in keys
     try:
         binary_key = b'key\x00with\x00nulls'
-        result = r.execute_command('infcache.restore', binary_key)
+        result = r.execute_command('spill.restore', binary_key)
         # Should handle without crashing
         assert result is None or isinstance(result, (str, bytes))
     except redis.ResponseError:
@@ -304,7 +304,7 @@ def test_concurrent_access_patterns():
                 if random.random() > 0.7:
                     test_key = f'concurrent_{worker_id}_{max(0, i-10)}'
                     try:
-                        result = client.execute_command('infcache.restore', test_key)
+                        result = client.execute_command('spill.restore', test_key)
                         if result == 'OK':
                             results['success'] += 1
                     except:
@@ -313,7 +313,7 @@ def test_concurrent_access_patterns():
                 # Randomly check stats
                 if random.random() > 0.9:
                     try:
-                        client.execute_command('infcache.stats')
+                        client.execute_command('spill.stats')
                     except:
                         pass
 
@@ -331,7 +331,7 @@ def test_concurrent_access_patterns():
         t.join()
 
     # Verify system stability
-    final_stats = r.execute_command('infcache.stats')
+    final_stats = r.execute_command('spill.stats')
     assert isinstance(final_stats, list), "Stats should work after concurrent access"
 
     print(f"  Concurrent access: {results['success']} successful operations, {len(results['errors'])} errors")
@@ -371,7 +371,7 @@ def test_data_corruption_resilience():
     for key, expected_data in stored_keys:
         if r.get(key) is None:
             try:
-                result = r.execute_command('infcache.restore', key)
+                result = r.execute_command('spill.restore', key)
                 if result == b'OK':
                     restored_data = r.get(key)
                     if restored_data == expected_data:
@@ -416,7 +416,7 @@ def test_ttl_edge_cases_precision():
         key = f'ttl_precision_{suffix}'
         if r.get(key) is None:
             try:
-                result = r.execute_command('infcache.restore', key)
+                result = r.execute_command('spill.restore', key)
                 if result == 'OK':
                     restored_ttl = r.ttl(key)
                     if restored_ttl > 0 and restored_ttl <= ttl:
@@ -444,7 +444,7 @@ def test_security_boundary_conditions():
         time.sleep(0.1)
 
         if r.get(max_key) is None:
-            result = r.execute_command('infcache.restore', max_key)
+            result = r.execute_command('spill.restore', max_key)
             assert result == b'OK' or result is None  # Either works or rejects gracefully
     except:
         pass  # Rejection is acceptable for oversized keys
@@ -467,7 +467,7 @@ def test_security_boundary_conditions():
         pass  # System should handle or reject gracefully
 
     # Verify system is still responsive
-    stats = r.execute_command('infcache.stats')
+    stats = r.execute_command('spill.stats')
     assert isinstance(stats, list), "System should remain responsive after security tests"
 
     print("  ✓ Security boundary conditions handled appropriately")
@@ -493,11 +493,11 @@ def test_cleanup_command():
     time.sleep(3)
 
     # Get stats before cleanup
-    initial_stats = r.execute_command('infcache.stats')
+    initial_stats = r.execute_command('spill.stats')
     initial_dict = {initial_stats[i]: initial_stats[i+1] for i in range(0, len(initial_stats), 2)}
 
     # Run cleanup command
-    cleanup_result = r.execute_command('infcache.cleanup')
+    cleanup_result = r.execute_command('spill.cleanup')
     assert isinstance(cleanup_result, list), "Cleanup should return array result"
     cleanup_dict = {cleanup_result[i]: cleanup_result[i+1] for i in range(0, len(cleanup_result), 2)}
 
@@ -508,7 +508,7 @@ def test_cleanup_command():
     assert cleanup_dict['keys_removed'] >= 0, "keys_removed should be non-negative"
 
     # Get stats after cleanup
-    final_stats = r.execute_command('infcache.stats')
+    final_stats = r.execute_command('spill.stats')
     final_dict = {final_stats[i]: final_stats[i+1] for i in range(0, len(final_stats), 2)}
 
     # Verify keys_expired and keys_cleaned stats were updated
@@ -536,12 +536,12 @@ def test_expired_key_restoration():
     time.sleep(3)
 
     # Get stats before restore attempt
-    initial_stats = r.execute_command('infcache.stats')
+    initial_stats = r.execute_command('spill.stats')
     initial_dict = {initial_stats[i]: initial_stats[i+1] for i in range(0, len(initial_stats), 2)}
 
     # Try to restore expired key
     try:
-        result = r.execute_command('infcache.restore', test_key)
+        result = r.execute_command('spill.restore', test_key)
         # Should either return error or null
         assert result in [None, 'ERR Key has expired'], f"Expected expiry error or null, got: {result}"
     except redis.ResponseError as e:
@@ -549,7 +549,7 @@ def test_expired_key_restoration():
         assert 'expired' in str(e).lower(), f"Expected expiry error, got: {e}"
 
     # Get stats after restore attempt
-    final_stats = r.execute_command('infcache.stats')
+    final_stats = r.execute_command('spill.stats')
     final_dict = {final_stats[i]: final_stats[i+1] for i in range(0, len(final_stats), 2)}
 
     # Verify keys_expired stat was incremented
@@ -560,7 +560,7 @@ def test_expired_key_restoration():
 
 def main():
     """Main test runner for advanced scenarios"""
-    print("=== DiceDB Infcache Advanced Test Scenarios ===\n")
+    print("=== DiceDB Spill Advanced Test Scenarios ===\n")
 
     # Check if server is running
     try:
@@ -568,7 +568,7 @@ def main():
         r.ping()
     except:
         print("ERROR: Cannot connect to database server on port 6379")
-        print("Please start DiceDB server with infcache module loaded")
+        print("Please start DiceDB server with spill module loaded")
         sys.exit(1)
 
     # Run advanced tests

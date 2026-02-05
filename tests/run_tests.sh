@@ -14,9 +14,9 @@ UNIT_TEST_BINARY="test_unit"
 INTEGRATION_TEST_SCRIPT="test_integration.py"
 EDGE_CASE_TEST_SCRIPT="test_edge_cases.py"
 ADVANCED_SCENARIOS_SCRIPT="test_advanced_scenarios.py"
-MODULE_BINARY="../lib-infcache.so"
+MODULE_BINARY="../lib-spill.so"
 
-echo "DiceDB Infcache Test Suite"
+echo "DiceDB Spill Test Suite"
 
 print_status() {
     local status=$1
@@ -81,7 +81,7 @@ run_integration_tests() {
         return 0
     else
         print_status "ERROR" "Integration tests failed"
-        print_status "INFO" "Ensure DiceDB server on port 6379 with infcache module"
+        print_status "INFO" "Ensure DiceDB server on port 6379 with spill module"
         return 1
     fi
 }
@@ -160,7 +160,7 @@ try:
         for i in range(1000):
             if r.get(f'perf_key_{i}') is None:
                 try:
-                    if r.execute_command('infcache.restore', f'perf_key_{i}') == 'OK':
+                    if r.execute_command('spill.restore', f'perf_key_{i}') == 'OK':
                         restored += 1
                 except: pass
         restore_time = time.time() - start_time

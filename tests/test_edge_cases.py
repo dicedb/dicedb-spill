@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Edge cases and error condition tests for DiceDB Infcache module
+Edge cases and error condition tests for DiceDB Spill module
 Tests various boundary conditions, error scenarios, and stress cases
 """
 
@@ -127,7 +127,7 @@ def test_special_key_names():
     for key in set_keys:
         if r.get(key) is None:
             try:
-                result = r.execute_command('infcache.restore', key)
+                result = r.execute_command('spill.restore', key)
                 if result == b'OK':
                     restored += 1
             except Exception as e:
@@ -157,7 +157,7 @@ def test_concurrent_absttl_operations():
                 # Sometimes try to restore keys
                 if random.random() > 0.8:
                     try:
-                        result = r.execute_command('infcache.restore', key)
+                        result = r.execute_command('spill.restore', key)
                         if result == 'OK':
                             restored_keys.append(key)
                     except redis.ResponseError:
@@ -216,7 +216,7 @@ def test_rocksdb_corruption_simulation():
 
     for key in evicted_keys:
         try:
-            result = r.execute_command('infcache.restore', key)
+            result = r.execute_command('spill.restore', key)
             if result == 'OK':
                 restore_results['ok'] += 1
             elif result is None:
@@ -257,7 +257,7 @@ def test_memory_pressure_scenarios():
 
     # Try to restore the baseline key
     try:
-        result = r.execute_command('infcache.restore', 'memory_pressure_key')
+        result = r.execute_command('spill.restore', 'memory_pressure_key')
         if result == 'OK':
             value = r.get('memory_pressure_key')
             assert value == 'memory_pressure_value'
@@ -294,7 +294,7 @@ def test_rapid_expiration_scenarios():
     for key, original_ttl in rapid_keys:
         if r.get(key) is None:  # Key was evicted
             try:
-                result = r.execute_command('infcache.restore', key)
+                result = r.execute_command('spill.restore', key)
                 if result == 'OK':
                     restored_count += 1
                 elif result is None:
@@ -332,7 +332,7 @@ def test_clock_skew_simulation():
         key = f'clock_skew_{i}'
         if r.get(key) is None:
             try:
-                result = r.execute_command('infcache.restore', key)
+                result = r.execute_command('spill.restore', key)
                 if result == 'OK':
                     ttl = r.ttl(key)
                     original_ttl = 600 + (i * 60)
@@ -350,7 +350,7 @@ def test_error_recovery():
 
     # Test 1: Try to restore non-existent keys
     for i in range(10):
-        result = r.execute_command('infcache.restore', f'nonexistent_{i}')
+        result = r.execute_command('spill.restore', f'nonexistent_{i}')
         assert result is None, f"Expected None for nonexistent key, got {result}"
 
     # Test 2: Mix valid and invalid operations
@@ -370,7 +370,7 @@ def test_error_recovery():
     errors_handled = 0
     for case in error_cases:
         try:
-            result = r.execute_command('infcache.restore', case)
+            result = r.execute_command('spill.restore', case)
             # Any result is acceptable (None, error, etc.)
             errors_handled += 1
         except:
@@ -378,7 +378,7 @@ def test_error_recovery():
 
     # Verify normal operation still works
     if r.get('error_recovery_key') is None:
-        result = r.execute_command('infcache.restore', 'error_recovery_key')
+        result = r.execute_command('spill.restore', 'error_recovery_key')
         if result == 'OK':
             value = r.get('error_recovery_key')
             assert value == 'error_recovery_value'
@@ -387,7 +387,7 @@ def test_error_recovery():
 
 def main():
     """Main test runner for edge cases"""
-    print("=== DiceDB Infcache Edge Cases and Error Conditions ===\n")
+    print("=== DiceDB Spill Edge Cases and Error Conditions ===\n")
 
     # Check if server is running
     try:
@@ -395,7 +395,7 @@ def main():
         r.ping()
     except:
         print("ERROR: Cannot connect to database server on port 6379")
-        print("Please start DiceDB server with infcache module loaded")
+        print("Please start DiceDB server with spill module loaded")
         sys.exit(1)
 
     # Run edge case tests

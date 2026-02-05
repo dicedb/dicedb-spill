@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Module Lifecycle Integration Tests for DiceDB Infcache Module
+Module Lifecycle Integration Tests for DiceDB Spill Module
 
 Tests module loading, unloading, configuration validation, persistence across
 restarts, and other lifecycle-related functionality.
@@ -28,7 +28,7 @@ except ImportError:
 
 # Test configuration
 TEST_PORT = 8380  # Different port to avoid conflicts
-MODULE_PATH = "../lib-infcache.so"
+MODULE_PATH = "../lib-spill.so"
 
 def is_port_in_use(port):
     """Check if a port is already in use"""
@@ -42,7 +42,7 @@ def temporary_dicedb_server(port, module_args=None):
         raise Exception(f"Port {port} is already in use")
 
     # Create temporary directory for this test
-    temp_dir = tempfile.mkdtemp(prefix="infcache_lifecycle_test_")
+    temp_dir = tempfile.mkdtemp(prefix="spill_lifecycle_test_")
 
     try:
         # Build command to start server
@@ -118,12 +118,12 @@ def test_module_loading_with_default_config():
     with temporary_dicedb_server(TEST_PORT) as (proc, temp_dir):
         r = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True)
 
-        # Test that infcache commands are available
-        stats = r.execute_command('infcache.stats')
+        # Test that spill commands are available
+        stats = r.execute_command('spill.stats')
         assert isinstance(stats, list), "Stats should return list"
 
         # Test that RocksDB was initialized
-        info = r.execute_command('infcache.info')
+        info = r.execute_command('spill.info')
         assert isinstance(info, str) and len(info) > 0, "Info should return RocksDB stats"
 
 def test_module_loading_with_custom_config():
@@ -140,7 +140,7 @@ def test_module_loading_with_custom_config():
             r = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True)
 
             # Test that module loaded with custom config
-            stats = r.execute_command('infcache.stats')
+            stats = r.execute_command('spill.stats')
             assert isinstance(stats, list), "Stats should return list"
 
             # Verify custom RocksDB path is being used
@@ -168,9 +168,9 @@ def test_module_config_validation():
                 # If we get here, check if the module actually failed to load
                 try:
                     r = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True, socket_connect_timeout=1)
-                    # Try to execute infcache command - should fail or not be available
+                    # Try to execute spill command - should fail or not be available
                     try:
-                        r.execute_command('infcache.stats')
+                        r.execute_command('spill.stats')
                         # If command works, the module loaded despite invalid config (unexpected)
                         assert False, "Module should not load with max-memory < 20MB"
                     except redis.ResponseError:
@@ -202,11 +202,11 @@ def test_module_min_memory_validation():
             r = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True)
 
             # Module should load successfully
-            stats = r.execute_command('infcache.stats')
+            stats = r.execute_command('spill.stats')
             assert isinstance(stats, list), "Stats should work with 20MB config"
 
             # Verify module is functional
-            info = r.execute_command('infcache.info')
+            info = r.execute_command('spill.info')
             assert isinstance(info, str) and len(info) > 0, "Info should return data"
 
         # Clean up for next test
@@ -234,7 +234,7 @@ def test_module_min_memory_validation():
                     r = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True, socket_connect_timeout=1)
                     server_started = True
                     try:
-                        r.execute_command('infcache.stats')
+                        r.execute_command('spill.stats')
                         module_loaded = True
                     except redis.ResponseError:
                         module_loaded = False
@@ -271,13 +271,13 @@ def test_memory_allocation_distribution():
             r = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True)
 
             # Get info to check memory allocation
-            info = r.execute_command('infcache.info')
+            info = r.execute_command('spill.info')
             assert isinstance(info, str), "Info should return string"
 
             # Parse info to verify configuration
             # The log output should show block_cache=8MB and write_buffer=28MB
             # We can verify the module loaded successfully with the right config
-            stats = r.execute_command('infcache.stats')
+            stats = r.execute_command('spill.stats')
             assert isinstance(stats, list), "Module should be functional with correct memory allocation"
 
             # Verify the max_memory setting in info
@@ -313,7 +313,7 @@ def test_persistence_across_restart():
             assert r1.get('persist_key_2') is None
 
             # Verify they can be restored
-            result1 = r1.execute_command('infcache.restore', 'persist_key_1')
+            result1 = r1.execute_command('spill.restore', 'persist_key_1')
             assert result1 == 'OK'
             assert r1.get('persist_key_1') == 'persist_value_1'
 
@@ -322,7 +322,7 @@ def test_persistence_across_restart():
             r2 = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True)
 
             # Try to restore keys from previous session
-            result2 = r2.execute_command('infcache.restore', 'persist_key_2')
+            result2 = r2.execute_command('spill.restore', 'persist_key_2')
             if result2 == 'OK':
                 value = r2.get('persist_key_2')
                 assert value == 'persist_value_2', "Persisted value should match"
@@ -369,8 +369,8 @@ def test_multiple_module_instances():
                 time.sleep(0.2)
 
                 # Verify data isolation
-                result1 = r1.execute_command('infcache.restore', 'instance1_key')
-                result2 = r2.execute_command('infcache.restore', 'instance2_key')
+                result1 = r1.execute_command('spill.restore', 'instance1_key')
+                result2 = r2.execute_command('spill.restore', 'instance2_key')
 
                 if result1 == 'OK':
                     assert r1.get('instance1_key') == 'instance1_value'
@@ -378,8 +378,8 @@ def test_multiple_module_instances():
                     assert r2.get('instance2_key') == 'instance2_value'
 
                 # Verify cross-instance isolation
-                cross_result1 = r1.execute_command('infcache.restore', 'instance2_key')
-                cross_result2 = r2.execute_command('infcache.restore', 'instance1_key')
+                cross_result1 = r1.execute_command('spill.restore', 'instance2_key')
+                cross_result2 = r2.execute_command('spill.restore', 'instance1_key')
 
                 assert cross_result1 is None, "Instance1 should not have instance2's data"
                 assert cross_result2 is None, "Instance2 should not have instance1's data"
@@ -412,7 +412,7 @@ def test_module_graceful_shutdown():
             assert r.get('shutdown_key') is None
 
             # Get initial stats
-            stats = r.execute_command('infcache.stats')
+            stats = r.execute_command('spill.stats')
             stats_dict = {stats[i]: stats[i+1] for i in range(0, len(stats), 2)}
             keys_stored = stats_dict['keys_stored']
 
@@ -436,19 +436,19 @@ def test_module_error_recovery():
 
         # 1. Invalid command arguments
         try:
-            r.execute_command('infcache.restore')  # Missing key
+            r.execute_command('spill.restore')  # Missing key
             assert False, "Should raise error for missing arguments"
         except redis.ResponseError:
             pass  # Expected
 
         # 2. Restore non-existent key
-        result = r.execute_command('infcache.restore', 'definitely_not_exists')
+        result = r.execute_command('spill.restore', 'definitely_not_exists')
         assert result is None, "Non-existent key should return None"
 
         # 3. Very long key names
         long_key = 'x' * 10000
         try:
-            result = r.execute_command('infcache.restore', long_key)
+            result = r.execute_command('spill.restore', long_key)
             # Should handle gracefully (return None or error)
             assert result is None or isinstance(result, str)
         except redis.ResponseError:
@@ -456,7 +456,7 @@ def test_module_error_recovery():
 
         # 4. Binary data in keys
         try:
-            result = r.execute_command('infcache.restore', b'\x00\x01\x02\x03')
+            result = r.execute_command('spill.restore', b'\x00\x01\x02\x03')
             # Should handle gracefully
             assert result is None or isinstance(result, (str, bytes))
         except redis.ResponseError:
@@ -466,7 +466,7 @@ def test_module_error_recovery():
         r.set('recovery_test', 'recovery_value')
         assert r.get('recovery_test') == 'recovery_value'
 
-        stats = r.execute_command('infcache.stats')
+        stats = r.execute_command('spill.stats')
         assert isinstance(stats, list)
 
 def test_module_performance_under_load():
@@ -501,7 +501,7 @@ def test_module_performance_under_load():
                 for i in range(num_ops):
                     key = f'load_test_{thread_id}_{i}'
                     try:
-                        result = thread_client.execute_command('infcache.restore', key)
+                        result = thread_client.execute_command('spill.restore', key)
                         if result == 'OK':
                             results['restored'] += 1
                     except Exception as e:
@@ -539,12 +539,12 @@ def test_module_performance_under_load():
         assert len(results['errors']) < results['stored'] * 0.1, "Error rate should be < 10%"
 
         # Verify system is still responsive
-        final_stats = r.execute_command('infcache.stats')
+        final_stats = r.execute_command('spill.stats')
         assert isinstance(final_stats, list)
 
 def main():
     """Main test runner for module lifecycle tests"""
-    print("=== DiceDB Infcache Module Lifecycle Tests ===\n")
+    print("=== DiceDB Spill Module Lifecycle Tests ===\n")
 
     # Check prerequisites
     if not os.path.exists(MODULE_PATH):

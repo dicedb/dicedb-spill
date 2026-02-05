@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Integration tests for DiceDB Infcache module
+Integration tests for DiceDB Spill module
 Tests the module's behavior with a real DiceDB/Valkey instance
 """
 
@@ -23,13 +23,13 @@ except ImportError:
 
 # Test configuration
 REDIS_PORT = 6379
-MODULE_PATH = "../lib-infcache.so"
+MODULE_PATH = "../lib-spill.so"
 ROCKSDB_PATH = None  # Will be set to temp directory
 
 def setup_test_environment():
     """Set up test environment with temporary RocksDB directory"""
     global ROCKSDB_PATH
-    ROCKSDB_PATH = tempfile.mkdtemp(prefix="infcache_test_")
+    ROCKSDB_PATH = tempfile.mkdtemp(prefix="spill_test_")
     return ROCKSDB_PATH
 
 def cleanup_test_environment():
@@ -45,11 +45,11 @@ def check_server_running():
         r = redis.Redis(host='localhost', port=REDIS_PORT, socket_connect_timeout=2, socket_timeout=2)
         r.ping()
         try:
-            r.execute_command('infcache.info')
+            r.execute_command('spill.info')
             return True
         except redis.ResponseError as e:
             if 'unknown command' in str(e).lower():
-                print(f"ERROR: Infcache module not loaded")
+                print(f"ERROR: Spill module not loaded")
                 return False
             return True
 
@@ -94,7 +94,7 @@ def test_basic_eviction_and_restore():
         return
 
     # Restore the key
-    result = r.execute_command('infcache.restore', 'test_key')
+    result = r.execute_command('spill.restore', 'test_key')
     assert result == 'OK', f"Restore failed: {result}"
 
     # Verify restored value
@@ -122,7 +122,7 @@ def test_ttl_preservation():
     time.sleep(1)
 
     # Restore the key
-    result = r.execute_command('infcache.restore', 'ttl_key')
+    result = r.execute_command('spill.restore', 'ttl_key')
     assert result == 'OK', f"Restore failed: {result}"
 
     # Check TTL is preserved (should be less than initial due to time passed)
@@ -157,7 +157,7 @@ def test_expired_key_not_restored():
 
     # Try to restore expired key
     try:
-        result = r.execute_command('infcache.restore', 'expire_key')
+        result = r.execute_command('spill.restore', 'expire_key')
         # Should either get None (not found) or error message about expiration
         assert result is None or ('expired' in str(result).lower() if result else True), f"Expected expiration handling, got: {result}"
     except redis.ResponseError as e:
@@ -168,7 +168,7 @@ def test_restore_nonexistent_key():
     """Test restoring a key that doesn't exist in RocksDB"""
     r = redis.Redis(host='localhost', port=REDIS_PORT, decode_responses=True)
 
-    result = r.execute_command('infcache.restore', 'nonexistent_key')
+    result = r.execute_command('spill.restore', 'nonexistent_key')
     assert result is None, f"Expected None for nonexistent key, got: {result}"
 
 def test_multiple_evictions_and_restores():
@@ -203,7 +203,7 @@ def test_multiple_evictions_and_restores():
     restored = 0
     for key in evicted:
         try:
-            result = r.execute_command('infcache.restore', key)
+            result = r.execute_command('spill.restore', key)
             if result == 'OK':
                 restored += 1
                 value = r.get(key)
@@ -215,8 +215,8 @@ def test_multiple_evictions_and_restores():
     assert restored > 0, f"No keys were restored out of {len(evicted)} evicted"
     print(f"  {restored}/{len(evicted)} keys successfully restored")
 
-def test_infcache_info_command():
-    """Test the infcache.info command"""
+def test_spill_info_command():
+    """Test the spill.info command"""
     r = redis.Redis(host='localhost', port=REDIS_PORT, decode_responses=True)
 
     # Trigger some evictions first
@@ -227,9 +227,9 @@ def test_infcache_info_command():
         r.set(f'filler_info_{i}', 'b' * 5000)
 
     # Get RocksDB stats
-    stats = r.execute_command('infcache.info')
-    assert stats is not None, "infcache.info returned None"
-    assert len(stats) > 0, "infcache.info returned empty stats"
+    stats = r.execute_command('spill.info')
+    assert stats is not None, "spill.info returned None"
+    assert len(stats) > 0, "spill.info returned empty stats"
     assert 'rocksdb' in stats.lower() or 'level' in stats.lower(), "Stats don't look like RocksDB stats"
 
 def test_key_with_spaces_and_special_chars():
@@ -265,7 +265,7 @@ def test_key_with_spaces_and_special_chars():
     for key in set_keys:
         if r.get(key) is None:
             try:
-                result = r.execute_command('infcache.restore', key)
+                result = r.execute_command('spill.restore', key)
                 if result == b'OK':
                     value = r.get(key)
                     if value == b'special_value':
@@ -297,7 +297,7 @@ def test_double_restore():
         return
 
     # First restore
-    result1 = r.execute_command('infcache.restore', 'double_key')
+    result1 = r.execute_command('spill.restore', 'double_key')
     assert result1 == 'OK', f"First restore failed: {result1}"
 
     # Verify the key was restored
@@ -308,7 +308,7 @@ def test_double_restore():
     r.delete('double_key')
 
     # Second restore should return None (key was removed from RocksDB after first restore)
-    result2 = r.execute_command('infcache.restore', 'double_key')
+    result2 = r.execute_command('spill.restore', 'double_key')
     assert result2 is None, f"Second restore should return None, got: {result2}"
 
 def test_large_value():
@@ -326,7 +326,7 @@ def test_large_value():
     if r.get('large_key') is None:
         # Restore large key
         try:
-            result = r.execute_command('infcache.restore', 'large_key')
+            result = r.execute_command('spill.restore', 'large_key')
             if result == b'OK':
                 # Verify large value
                 restored_value = r.get('large_key')
@@ -359,7 +359,7 @@ def test_concurrent_operations():
 
                 if random.random() > 0.8:  # Less frequent restore attempts
                     try:
-                        r.execute_command('infcache.restore', key)
+                        r.execute_command('spill.restore', key)
                     except redis.ResponseError:
                         pass  # Key might not exist, ignore error
         except Exception as e:
@@ -416,7 +416,7 @@ def test_absttl_preservation_during_eviction():
     time.sleep(2)
 
     # Restore the key (should use ABSTTL internally)
-    result = r.execute_command('infcache.restore', 'absttl_test_key')
+    result = r.execute_command('spill.restore', 'absttl_test_key')
     assert result == 'OK', f"ABSTTL restore failed: {result}"
 
     # Verify the key was restored
@@ -459,7 +459,7 @@ def test_expired_key_deletion_from_rocksdb():
     time.sleep(4)
 
     # Try to restore expired key - should return None (not found) because it was deleted
-    result = r.execute_command('infcache.restore', 'expire_test_key')
+    result = r.execute_command('spill.restore', 'expire_test_key')
     assert result is None, f"Expected None for expired key, got: {result}"
 
     # Verify the key is not in Redis either
@@ -503,7 +503,7 @@ def test_absttl_precision():
     successful_restores = 0
     for key, original_ttl, initial_ttl in evicted_keys:
         try:
-            result = r.execute_command('infcache.restore', key)
+            result = r.execute_command('spill.restore', key)
             if result == 'OK':
                 restored_ttl = r.ttl(key)
                 if restored_ttl > 0:
@@ -553,7 +553,7 @@ def test_absttl_edge_cases():
     # Test short TTL restoration
     if short_evicted:
         print("  Testing short TTL restoration...")
-        result = r.execute_command('infcache.restore', 'edge_short_ttl')
+        result = r.execute_command('spill.restore', 'edge_short_ttl')
         if result == 'OK':
             restored_value = r.get('edge_short_ttl')
             restored_ttl = r.ttl('edge_short_ttl')
@@ -568,7 +568,7 @@ def test_absttl_edge_cases():
     # Test long TTL restoration
     if long_evicted:
         print("  Testing long TTL restoration...")
-        result = r.execute_command('infcache.restore', 'edge_long_ttl')
+        result = r.execute_command('spill.restore', 'edge_long_ttl')
         if result == 'OK':
             restored_value = r.get('edge_long_ttl')
             restored_ttl = r.ttl('edge_long_ttl')
@@ -619,7 +619,7 @@ def test_multiple_absttl_keys():
     restored_count = 0
     for key, expected_value, original_ttl, initial_ttl in evicted_keys:
         try:
-            result = r.execute_command('infcache.restore', key)
+            result = r.execute_command('spill.restore', key)
             if result == 'OK':
                 # Verify value and TTL
                 actual_value = r.get(key)
@@ -676,7 +676,7 @@ def test_absttl_vs_relative_ttl_consistency():
     time.sleep(2)
 
     # Restore evicted key
-    result = r.execute_command('infcache.restore', 'consistency_test_1')
+    result = r.execute_command('spill.restore', 'consistency_test_1')
     if result == 'OK':
         restored_ttl_1 = r.ttl('consistency_test_1')
         current_ttl_2 = r.ttl('consistency_test_2') if not key2_evicted else None
@@ -702,7 +702,7 @@ def test_absttl_vs_relative_ttl_consistency():
 
 def main():
     """Main test runner"""
-    print("=== DiceDB Infcache Integration Tests ===\n")
+    print("=== DiceDB Spill Integration Tests ===\n")
 
     # Check if module exists
     if not os.path.exists(MODULE_PATH):
@@ -724,7 +724,7 @@ def main():
         (test_expired_key_not_restored, "Expired key not restored"),
         (test_restore_nonexistent_key, "Restore nonexistent key"),
         (test_multiple_evictions_and_restores, "Multiple evictions and restores"),
-        (test_infcache_info_command, "Infcache info command"),
+        (test_spill_info_command, "Spill info command"),
         (test_key_with_spaces_and_special_chars, "Keys with special characters"),
         (test_double_restore, "Double restore removes from RocksDB"),
         (test_large_value, "Large value eviction and restore"),

@@ -13,9 +13,9 @@
 #define MIN_MAX_MEMORY_MB 20  // Minimum max-memory limit: 20MB
 
 // Logging control: set to 1 to enable debug/verbose logging, 0 to disable
-#define INFCACHE_DEBUG 0
+#define SPILL_DEBUG 0
 
-#if INFCACHE_DEBUG
+#if SPILL_DEBUG
 #define LOG(ctx, level, ...) ValkeyModule_Log(ctx, level, __VA_ARGS__)
 #else
 #define LOG(ctx, level, ...) (void)0
@@ -34,9 +34,9 @@ typedef struct {
     uint64_t keys_cleaned;
     uint64_t bytes_written;
     uint64_t bytes_read;
-} InfcacheStats;
+} SpillStats;
 
-static InfcacheStats stats = {0};
+static SpillStats stats = {0};
 
 static const char *ERR_DB_NOT_INIT = "ERR RocksDB not initialized";
 static const char *ERR_CORRUPTED_DATA = "ERR Corrupted data in RocksDB";
@@ -44,9 +44,9 @@ static const char *ERR_CORRUPTED_DATA = "ERR Corrupted data in RocksDB";
 typedef struct {
     char *path;
     size_t max_memory;  // Maximum memory budget for RocksDB (block cache + write buffers)
-} InfcacheConfig;
+} SpillConfig;
 
-static InfcacheConfig config = {
+static SpillConfig config = {
     .path = NULL,
     .max_memory = 256 * 1024 * 1024  // Default: 256MB total memory budget
 };
@@ -57,11 +57,11 @@ static void DeleteKeyFromDB(const char *keyname, size_t keylen) {
     char *err = NULL;
     rocksdb_delete(db, woptions, keyname, keylen, &err);
     if (err) {
-        LOG(module_ctx, "warning", "infcache: failed to delete key from RocksDB: %.*s, error: %s",
+        LOG(module_ctx, "warning", "spill: failed to delete key from RocksDB: %.*s, error: %s",
             (int)keylen, keyname, err);
         free(err);
     } else {
-        LOG(module_ctx, "debug", "infcache: deleted key from RocksDB: %.*s", (int)keylen, keyname);
+        LOG(module_ctx, "debug", "spill: deleted key from RocksDB: %.*s", (int)keylen, keyname);
     }
 }
 
@@ -75,17 +75,17 @@ static int RestoreKeyFromDB(ValkeyModuleCtx *ctx, ValkeyModuleString *key, const
     char *val = rocksdb_get(db, roptions, keyname, keylen, &vallen, &err);
 
     if (err != NULL) {
-        LOG(ctx, "warning", "infcache: error getting key=%.*s from RocksDB: %s", (int)keylen, keyname, err);
+        LOG(ctx, "warning", "spill: error getting key=%.*s from RocksDB: %s", (int)keylen, keyname, err);
         free(err);
         return -1;
     }
 
     if (val == NULL) {
-        LOG(ctx, "notice", "infcache: key=%.*s not found not in RocksDB", (int)keylen, keyname);
+        LOG(ctx, "notice", "spill: key=%.*s not found not in RocksDB", (int)keylen, keyname);
         return -2;
     }
 
-    LOG(ctx, "notice", "infcache: key=%.*s found in RocksDB with value_len=%zu bytes", (int)keylen, keyname, vallen);
+    LOG(ctx, "notice", "spill: key=%.*s found in RocksDB with value_len=%zu bytes", (int)keylen, keyname, vallen);
 
     // Validate data format
     if (vallen < sizeof(int64_t)) {
@@ -102,7 +102,7 @@ static int RestoreKeyFromDB(ValkeyModuleCtx *ctx, ValkeyModuleString *key, const
     if (expiry_time_ms > 0) {
         int64_t current_time_ms = (int64_t)time(NULL) * 1000;
         if (expiry_time_ms <= current_time_ms) {
-            LOG(ctx, "notice", "infcache: key=%.*s has expired (expiry=%lld, now=%lld), deleting",
+            LOG(ctx, "notice", "spill: key=%.*s has expired (expiry=%lld, now=%lld), deleting",
                 (int)keylen, keyname, (long long)expiry_time_ms, (long long)current_time_ms);
             __sync_fetch_and_add(&stats.keys_expired, 1);
             DeleteKeyFromDB(keyname, keylen);
@@ -120,10 +120,10 @@ static int RestoreKeyFromDB(ValkeyModuleCtx *ctx, ValkeyModuleString *key, const
         int64_t current_time_ms = (int64_t)time(NULL) * 1000;
         int64_t ttl_ms = expiry_time_ms - current_time_ms;
         if (ttl_ms < 0) ttl_ms = 1;  // Minimum 1ms TTL
-        LOG(ctx, "debug", "infcache: restoring key=%.*s with TTL=%lld ms", (int)keylen, keyname, (long long)ttl_ms);
+        LOG(ctx, "debug", "spill: restoring key=%.*s with TTL=%lld ms", (int)keylen, keyname, (long long)ttl_ms);
         reply = ValkeyModule_Call(ctx, "RESTORE", "slsc", key, ttl_ms, dump_data, "REPLACE");
     } else {
-        LOG(ctx, "debug", "infcache: restoring key=%.*s with no expiry", (int)keylen, keyname);
+        LOG(ctx, "debug", "spill: restoring key=%.*s with no expiry", (int)keylen, keyname);
         reply = ValkeyModule_Call(ctx, "RESTORE", "slsc", key, 0, dump_data, "REPLACE");
     }
 
@@ -132,12 +132,12 @@ static int RestoreKeyFromDB(ValkeyModuleCtx *ctx, ValkeyModuleString *key, const
 
     int result = 0;
     if (reply && ValkeyModule_CallReplyType(reply) != VALKEYMODULE_REPLY_ERROR) {
-        LOG(ctx, "debug", "infcache: key=%.*s restored successfully", (int)keylen, keyname);
+        LOG(ctx, "debug", "spill: key=%.*s restored successfully", (int)keylen, keyname);
         __sync_fetch_and_add(&stats.keys_restored, 1);
         __sync_fetch_and_add(&stats.bytes_read, vallen);
         DeleteKeyFromDB(keyname, keylen);
     } else {
-        LOG(ctx, "warning", "infcache: failed to restore key=%.*s: %s", (int)keylen, keyname,
+        LOG(ctx, "warning", "spill: failed to restore key=%.*s: %s", (int)keylen, keyname,
             reply ? (ValkeyModule_CallReplyStringPtr(reply, NULL) ? ValkeyModule_CallReplyStringPtr(reply, NULL) : "no reply") : "no reply");
         result = -1;
     }
@@ -163,14 +163,14 @@ int ParseModuleArgs(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
         } else if (strcasecmp(key, "max-memory") == 0 || strcasecmp(key, "max_memory") == 0) {
             config.max_memory = (size_t)atoll(value);
             if (config.max_memory < MIN_MAX_MEMORY_MB * 1024 * 1024) {
-                ValkeyModule_Log(ctx, "warning", "infcache: max-memory must be at least %dMB, got %zu bytes", MIN_MAX_MEMORY_MB, config.max_memory);
+                ValkeyModule_Log(ctx, "warning", "spill: max-memory must be at least %dMB, got %zu bytes", MIN_MAX_MEMORY_MB, config.max_memory);
                 return VALKEYMODULE_ERR;
             }
         }
     }
 
     if (!config.path) {
-        ValkeyModule_Log(ctx, "warning", "infcache: 'path' parameter is required");
+        ValkeyModule_Log(ctx, "warning", "spill: 'path' parameter is required");
         return VALKEYMODULE_ERR;
     }
 
@@ -179,7 +179,7 @@ int ParseModuleArgs(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
 
 int InitRocksDB(ValkeyModuleCtx *ctx) {
     char *err = NULL;
-    LOG(ctx, "debug", "infcache: initializing RocksDB at path=%s with max_memory=%zu bytes",
+    LOG(ctx, "debug", "spill: initializing RocksDB at path=%s with max_memory=%zu bytes",
         config.path, config.max_memory);
 
     // Calculate memory distribution from max_memory budget
@@ -258,11 +258,11 @@ int InitRocksDB(ValkeyModuleCtx *ctx) {
 
     db = rocksdb_open(options, config.path, &err);
     if (err != NULL) {
-        ValkeyModule_Log(ctx, "warning", "infcache: failed to open RocksDB: %s", err);
+        ValkeyModule_Log(ctx, "warning", "spill: failed to open RocksDB: %s", err);
         free(err);
         return VALKEYMODULE_ERR;
     }
-    ValkeyModule_Log(ctx, "notice", "infcache: RocksDB opened successfully (block_cache=%zuMB, write_buffer=%zuMB)",
+    ValkeyModule_Log(ctx, "notice", "spill: RocksDB opened successfully (block_cache=%zuMB, write_buffer=%zuMB)",
                      block_cache_size / (1024 * 1024), write_buffer_size / (1024 * 1024));
 
     roptions = rocksdb_readoptions_create();
@@ -311,7 +311,7 @@ int PremissNotification(ValkeyModuleCtx *ctx, int type, const char *event, Valke
     VALKEYMODULE_NOT_USED(type);
 
     if (!event || !key || !db) {
-        LOG(module_ctx, "warning", "infcache: premiss called with invalid params: event=%p key=%p db=%p",
+        LOG(module_ctx, "warning", "spill: premiss called with invalid params: event=%p key=%p db=%p",
             (void*)event, (void*)key, (void*)db);
         return 0;
     }
@@ -320,8 +320,8 @@ int PremissNotification(ValkeyModuleCtx *ctx, int type, const char *event, Valke
     size_t keylen;
     const char *keyname = ValkeyModule_StringPtrLen(key, &keylen);
 
-    LOG(ctx, "notice", "infcache: premiss called for key=%.*s (len=%zu)", (int)keylen, keyname, keylen);
-    LOG(ctx, "debug", "infcache: checking RocksDB for key=%.*s", (int)keylen, keyname);
+    LOG(ctx, "notice", "spill: premiss called for key=%.*s (len=%zu)", (int)keylen, keyname, keylen);
+    LOG(ctx, "debug", "spill: checking RocksDB for key=%.*s", (int)keylen, keyname);
 
     RestoreKeyFromDB(ctx, key, keyname, keylen);
     return 0;
@@ -331,7 +331,7 @@ int PreevictionKeyNotification(ValkeyModuleCtx *ctx, int type, const char *event
     VALKEYMODULE_NOT_USED(type);
 
     if (!event || !key || !db) {
-        LOG(module_ctx, "warning", "infcache: preeviction called with invalid params: event=%p key=%p db=%p",
+        LOG(module_ctx, "warning", "spill: preeviction called with invalid params: event=%p key=%p db=%p",
             (void*)event, (void*)key, (void*)db);
         return 0;
     }
@@ -340,12 +340,12 @@ int PreevictionKeyNotification(ValkeyModuleCtx *ctx, int type, const char *event
     size_t keylen;
     const char *keyname = ValkeyModule_StringPtrLen(key, &keylen);
 
-    LOG(ctx, "notice", "infcache: preeviction called for key=%.*s (len=%zu)", (int)keylen, keyname, keylen);
-    LOG(ctx, "debug", "infcache: calling DUMP for key=%.*s", (int)keylen, keyname);
+    LOG(ctx, "notice", "spill: preeviction called for key=%.*s (len=%zu)", (int)keylen, keyname, keylen);
+    LOG(ctx, "debug", "spill: calling DUMP for key=%.*s", (int)keylen, keyname);
 
     ValkeyModuleCallReply *dump_reply = ValkeyModule_Call(ctx, "DUMP", "s", key);
     if (!dump_reply || ValkeyModule_CallReplyType(dump_reply) != VALKEYMODULE_REPLY_STRING) {
-        LOG(ctx, "warning", "infcache: DUMP failed for key=%.*s, reply_type=%d",
+        LOG(ctx, "warning", "spill: DUMP failed for key=%.*s, reply_type=%d",
             (int)keylen, keyname, dump_reply ? ValkeyModule_CallReplyType(dump_reply) : -1);
         if (dump_reply) ValkeyModule_FreeCallReply(dump_reply);
         return 0;
@@ -354,14 +354,14 @@ int PreevictionKeyNotification(ValkeyModuleCtx *ctx, int type, const char *event
     size_t dump_len;
     const char *dump_data = ValkeyModule_CallReplyStringPtr(dump_reply, &dump_len);
 
-    LOG(ctx, "debug", "infcache: DUMP successful for key=%.*s, dump_len=%zu", (int)keylen, keyname, dump_len);
+    LOG(ctx, "debug", "spill: DUMP successful for key=%.*s, dump_len=%zu", (int)keylen, keyname, dump_len);
 
     if (!dump_data) {
         ValkeyModule_FreeCallReply(dump_reply);
         return 0;
     }
 
-    LOG(ctx, "debug", "infcache: calling PTTL for key=%.*s", (int)keylen, keyname);
+    LOG(ctx, "debug", "spill: calling PTTL for key=%.*s", (int)keylen, keyname);
     ValkeyModuleCallReply *ttl_reply = ValkeyModule_Call(ctx, "PTTL", "s", key);
     int64_t pttl = -1;
     int64_t expiry_time_ms = -1;  // Absolute expiry timestamp
@@ -372,23 +372,23 @@ int PreevictionKeyNotification(ValkeyModuleCtx *ctx, int type, const char *event
         if (pttl > 0) {
             int64_t current_time_ms = (int64_t)time(NULL) * 1000;
             expiry_time_ms = current_time_ms + pttl;
-            LOG(ctx, "debug", "infcache: PTTL for key=%.*s is %lld ms, expiry_time=%lld",
+            LOG(ctx, "debug", "spill: PTTL for key=%.*s is %lld ms, expiry_time=%lld",
                 (int)keylen, keyname, (long long)pttl, (long long)expiry_time_ms);
         } else {
             // pttl is -1 (no expiry) or -2 (key doesn't exist)
             expiry_time_ms = pttl;
-            LOG(ctx, "debug", "infcache: PTTL for key=%.*s returned %lld (no expiry)",
+            LOG(ctx, "debug", "spill: PTTL for key=%.*s returned %lld (no expiry)",
                 (int)keylen, keyname, (long long)pttl);
         }
     }
 
     size_t total_len = sizeof(int64_t) + dump_len;
-    LOG(ctx, "debug", "infcache: storing key=%.*s, total_key_len=%zu (expiry_header=8 + value_len=%zu)",
+    LOG(ctx, "debug", "spill: storing key=%.*s, total_key_len=%zu (expiry_header=8 + value_len=%zu)",
         (int)keylen, keyname, total_len, dump_len);
 
     char *combined_data = malloc(total_len);
     if (!combined_data) {
-        LOG(ctx, "warning", "infcache: malloc failed for key=%.*s, total_key_len=%zu", (int)keylen, keyname, total_len);
+        LOG(ctx, "warning", "spill: malloc failed for key=%.*s, total_key_len=%zu", (int)keylen, keyname, total_len);
         ValkeyModule_FreeCallReply(dump_reply);
         if (ttl_reply) ValkeyModule_FreeCallReply(ttl_reply);
         return 0;
@@ -400,16 +400,16 @@ int PreevictionKeyNotification(ValkeyModuleCtx *ctx, int type, const char *event
     ptr += sizeof(int64_t);
     memcpy(ptr, dump_data, dump_len);
 
-    LOG(ctx, "notice", "infcache: storing key=%.*s directly to RocksDB", (int)keylen, keyname);
+    LOG(ctx, "notice", "spill: storing key=%.*s directly to RocksDB", (int)keylen, keyname);
     char *err = NULL;
     rocksdb_put(db, woptions, keyname, keylen, combined_data, total_len, &err);
     if (err != NULL) {
-        LOG(ctx, "warning", "infcache: failed to persist key=%.*s: %s", (int)keylen, keyname, err);
+        LOG(ctx, "warning", "spill: failed to persist key=%.*s: %s", (int)keylen, keyname, err);
         free(err);
     } else {
         __sync_fetch_and_add(&stats.keys_stored, 1);
         __sync_fetch_and_add(&stats.bytes_written, total_len);
-        LOG(ctx, "notice", "infcache: stored key=%.*s (len=%zu) to RocksDB, size=%zu, expiry=%lld ms",
+        LOG(ctx, "notice", "spill: stored key=%.*s (len=%zu) to RocksDB, size=%zu, expiry=%lld ms",
             (int)keylen, keyname, keylen, total_len, (long long)expiry_time_ms);
     }
 
@@ -432,7 +432,7 @@ int RestoreCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     size_t keylen;
     const char *keyname = ValkeyModule_StringPtrLen(argv[1], &keylen);
 
-    LOG(ctx, "debug", "infcache: restore command for key=%.*s", (int)keylen, keyname);
+    LOG(ctx, "debug", "spill: restore command for key=%.*s", (int)keylen, keyname);
 
     if (!keyname || keylen == 0) {
         return ValkeyModule_ReplyWithError(ctx, "ERR Invalid key data");
@@ -456,7 +456,7 @@ int CleanupCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     VALKEYMODULE_NOT_USED(argv);
     VALKEYMODULE_NOT_USED(argc);
 
-    LOG(ctx, "debug", "infcache: cleanup command started");
+    LOG(ctx, "debug", "spill: cleanup command started");
 
     if (!db) {
         return ValkeyModule_ReplyWithError(ctx, ERR_DB_NOT_INIT);
@@ -488,7 +488,7 @@ int CleanupCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
                 DeleteKeyFromDB(keyname, keylen);
                 keys_removed++;
                 __sync_fetch_and_add(&stats.keys_expired, 1);
-                LOG(ctx, "debug", "infcache: expired key removed: %.*s (ttl=%lld, now=%lld)",
+                LOG(ctx, "debug", "spill: expired key removed: %.*s (ttl=%lld, now=%lld)",
                     (int)keylen, keyname, (long long)ttl_ms, (long long)current_time_ms);
             }
         }
@@ -501,14 +501,14 @@ int CleanupCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     rocksdb_iter_destroy(iter);
 
     if (err != NULL) {
-        LOG(ctx, "warning", "infcache: cleanup iteration error: %s", err);
+        LOG(ctx, "warning", "spill: cleanup iteration error: %s", err);
         ValkeyModule_ReplyWithError(ctx, err);
         free(err);
         return VALKEYMODULE_OK;
     }
 
     __sync_fetch_and_add(&stats.keys_cleaned, keys_removed);
-    LOG(ctx, "debug", "infcache: cleanup completed: checked=%llu, removed=%llu",
+    LOG(ctx, "debug", "spill: cleanup completed: checked=%llu, removed=%llu",
         (unsigned long long)keys_checked, (unsigned long long)keys_removed);
 
     ValkeyModule_ReplyWithArray(ctx, 4);
@@ -607,8 +607,8 @@ int InfoCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
         return ValkeyModule_ReplyWithError(ctx, "ERR Out of memory");
     }
 
-    // Infcache section - our custom metrics
-    append_info_section(&buffer, &size, &capacity, "infcache");
+    // Spill section - our custom metrics
+    append_info_section(&buffer, &size, &capacity, "spill");
     append_info_line_int(&buffer, &size, &capacity, "keys_stored", stats.keys_stored);
     append_info_line_int(&buffer, &size, &capacity, "keys_restored", stats.keys_restored);
     append_info_line_int(&buffer, &size, &capacity, "keys_expired", stats.keys_expired);
@@ -736,21 +736,21 @@ int InfoCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
 }
 
 int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
-    if (ValkeyModule_Init(ctx, "infcache", 1, VALKEYMODULE_APIVER_1) == VALKEYMODULE_ERR) {
+    if (ValkeyModule_Init(ctx, "spill", 1, VALKEYMODULE_APIVER_1) == VALKEYMODULE_ERR) {
         return VALKEYMODULE_ERR;
     }
 
     module_ctx = ValkeyModule_GetDetachedThreadSafeContext(ctx);
 
-    LOG(ctx, "notice", "infcache: loading module with %d arguments", argc);
+    LOG(ctx, "notice", "spill: loading module with %d arguments", argc);
 
     if (ParseModuleArgs(ctx, argv, argc) != VALKEYMODULE_OK) {
-        ValkeyModule_Log(ctx, "warning", "infcache: failed to parse module arguments");
+        ValkeyModule_Log(ctx, "warning", "spill: failed to parse module arguments");
         return VALKEYMODULE_ERR;
     }
 
     if (InitRocksDB(ctx) != VALKEYMODULE_OK) {
-        ValkeyModule_Log(ctx, "warning", "infcache: failed to initialize RocksDB");
+        ValkeyModule_Log(ctx, "warning", "spill: failed to initialize RocksDB");
         CleanupRocksDB();
         return VALKEYMODULE_ERR;
     }
@@ -763,34 +763,34 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
         return VALKEYMODULE_ERR;
     }
 
-    if (ValkeyModule_CreateCommand(ctx, "infcache.restore", RestoreCommand, "write", 1, 1, 1) == VALKEYMODULE_ERR) {
+    if (ValkeyModule_CreateCommand(ctx, "spill.restore", RestoreCommand, "write", 1, 1, 1) == VALKEYMODULE_ERR) {
         CleanupRocksDB();
         return VALKEYMODULE_ERR;
     }
 
-    if (ValkeyModule_CreateCommand(ctx, "infcache.info", InfoCommand, "readonly", 0, 0, 0) == VALKEYMODULE_ERR) {
+    if (ValkeyModule_CreateCommand(ctx, "spill.info", InfoCommand, "readonly", 0, 0, 0) == VALKEYMODULE_ERR) {
         CleanupRocksDB();
         return VALKEYMODULE_ERR;
     }
 
-    if (ValkeyModule_CreateCommand(ctx, "infcache.cleanup", CleanupCommand, "write", 0, 0, 0) == VALKEYMODULE_ERR) {
+    if (ValkeyModule_CreateCommand(ctx, "spill.cleanup", CleanupCommand, "write", 0, 0, 0) == VALKEYMODULE_ERR) {
         CleanupRocksDB();
         return VALKEYMODULE_ERR;
     }
 
-    if (ValkeyModule_CreateCommand(ctx, "infcache.stats", StatsCommand, "readonly", 0, 0, 0) == VALKEYMODULE_ERR) {
+    if (ValkeyModule_CreateCommand(ctx, "spill.stats", StatsCommand, "readonly", 0, 0, 0) == VALKEYMODULE_ERR) {
         CleanupRocksDB();
         return VALKEYMODULE_ERR;
     }
 
-    ValkeyModule_Log(ctx, "notice", "infcache: module loaded successfully, path=%s, max_memory=%zuMB",
+    ValkeyModule_Log(ctx, "notice", "spill: module loaded successfully, path=%s, max_memory=%zuMB",
                      config.path, config.max_memory / (1024 * 1024));
 
     return VALKEYMODULE_OK;
 }
 
 int ValkeyModule_OnUnload(ValkeyModuleCtx *ctx) {
-    ValkeyModule_Log(ctx, "notice", "infcache: unloading module, stats: stored=%llu restored=%llu expired=%llu",
+    ValkeyModule_Log(ctx, "notice", "spill: unloading module, stats: stored=%llu restored=%llu expired=%llu",
                      (unsigned long long)stats.keys_stored,
                      (unsigned long long)stats.keys_restored,
                      (unsigned long long)stats.keys_expired);

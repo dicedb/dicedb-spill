@@ -1,8 +1,8 @@
-# DiceDB Infcache Module - Comprehensive Test Coverage Report
+# DiceDB Spill Module - Comprehensive Test Coverage Report
 
 ## Executive Summary
 
-The DiceDB Infcache module now has **98% comprehensive test coverage** with **100+ total tests** across multiple test suites, covering all critical functionality, edge cases, security scenarios, and performance characteristics.
+The DiceDB Spill module now has **98% comprehensive test coverage** with **100+ total tests** across multiple test suites, covering all critical functionality, edge cases, security scenarios, and performance characteristics.
 
 ## Test Suite Overview
 
@@ -41,7 +41,7 @@ The DiceDB Infcache module now has **98% comprehensive test coverage** with **10
 - ✅ Automatic restoration on premiss events
 - ✅ Large value handling and special characters
 - ✅ Concurrent operations and thread safety
-- ✅ All infcache commands (restore, info, stats, cleanup)
+- ✅ All spill commands (restore, info, stats, cleanup)
 - ✅ Error conditions and expired key handling
 
 ### 3. Edge Case Tests (10 tests) ✅
@@ -192,7 +192,7 @@ The DiceDB Infcache module now has **98% comprehensive test coverage** with **10
 
 ## Conclusion
 
-The DiceDB Infcache module now has **comprehensive, professional-grade test coverage** that ensures:
+The DiceDB Spill module now has **comprehensive, professional-grade test coverage** that ensures:
 
 1. **Reliability**: All critical paths are tested with multiple scenarios
 2. **Performance**: SIMD optimizations and batch operations validated

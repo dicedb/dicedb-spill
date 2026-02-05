@@ -1,7 +1,7 @@
 SHOBJ_CFLAGS ?= -W -Wall -fno-common -g -ggdb3 -std=gnu99 -O2
 SHOBJ_LDFLAGS ?= -shared
 
-MODULE_NAME = lib-infcache
+MODULE_NAME = lib-spill
 MODULE_SO = $(MODULE_NAME).so
 MODULE_H_DIR = ../../src
 
@@ -23,7 +23,7 @@ endif
 
 all: $(MODULE_SO)
 
-SOURCES = infcache.c
+SOURCES = spill.c
 OBJECTS = $(SOURCES:.c=.o)
 
 $(MODULE_SO): $(OBJECTS)

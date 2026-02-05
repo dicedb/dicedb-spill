@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Memory Configuration Tests for DiceDB Infcache Module
+Memory Configuration Tests for DiceDB Spill Module
 
 Tests the memory validation and allocation changes:
 1. Minimum 20MB validation
@@ -29,7 +29,7 @@ except ImportError:
 
 # Test configuration
 TEST_PORT = 8381  # Different port to avoid conflicts
-MODULE_PATH = "../lib-infcache.so"
+MODULE_PATH = "../lib-spill.so"
 
 def is_port_in_use(port):
     """Check if a port is already in use"""
@@ -41,7 +41,7 @@ def start_server_with_module(port, module_args, timeout=5):
     Start a DiceDB server with the module and return process handle.
     Returns (process, temp_dir, success)
     """
-    temp_dir = tempfile.mkdtemp(prefix="infcache_memory_test_")
+    temp_dir = tempfile.mkdtemp(prefix="spill_memory_test_")
 
     cmd = [
         'dicedb-server',
@@ -113,7 +113,7 @@ def test_memory_below_minimum():
                 try:
                     r = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True, socket_connect_timeout=2)
                     try:
-                        r.execute_command('infcache.stats')
+                        r.execute_command('spill.stats')
                         print(f"\nFAIL: Module loaded with {description} (should reject < 20MB)")
                         return False
                     except redis.ResponseError:
@@ -147,12 +147,12 @@ def test_memory_at_minimum():
         r = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True)
 
         # Module should be loaded and functional
-        stats = r.execute_command('infcache.stats')
+        stats = r.execute_command('spill.stats')
         if not isinstance(stats, list):
             print("FAIL: Module not functional with 20MB")
             return False
 
-        info = r.execute_command('infcache.info')
+        info = r.execute_command('spill.info')
         if not info or '20' not in info:
             print("FAIL: Module info doesn't show 20MB config")
             return False
@@ -193,7 +193,7 @@ def test_memory_above_minimum():
             r = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True)
 
             # Module should be loaded and functional
-            stats = r.execute_command('infcache.stats')
+            stats = r.execute_command('spill.stats')
             if not isinstance(stats, list):
                 print(f"\nFAIL: Module not functional with {description}")
                 return False
@@ -239,13 +239,13 @@ def test_memory_allocation_formula():
             r = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True)
 
             # Module should be functional
-            stats = r.execute_command('infcache.stats')
+            stats = r.execute_command('spill.stats')
             if not isinstance(stats, list):
                 print(f"\nFAIL: Module not functional with {description}")
                 return False
 
             # Get info to verify memory settings
-            info = r.execute_command('infcache.info')
+            info = r.execute_command('spill.info')
 
             # The server logs should show the correct allocation
             # We can't directly verify internal allocations from client,
@@ -301,7 +301,7 @@ def test_error_message_format():
 
 def main():
     """Main test runner"""
-    print("=== DiceDB Infcache Memory Configuration Tests ===\n")
+    print("=== DiceDB Spill Memory Configuration Tests ===\n")
 
     # Check prerequisites
     if not os.path.exists(MODULE_PATH):
