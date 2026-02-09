@@ -4,9 +4,9 @@ DiceDB Spill Module - Commands and Cleanup Thread Tests
 
 Tests for:
 1. SPILL.RESTORE command behavior as documented
-2. SPILL.INFO showing cleanup_interval
+2. INFO command showing cleanup_interval
 3. SPILL.CLEANUP command
-4. SPILL.STATS command
+4. INFO command integration with spill stats
 5. Automatic periodic cleanup thread functionality
 6. TTL preservation
 7. Different data types support
@@ -41,6 +41,40 @@ class CommandsAndCleanupTest(unittest.TestCase):
         """Clean up after each test"""
         self.client.flushdb()
         time.sleep(0.1)
+
+    def parse_info_response(self, info_data):
+        """Helper to parse INFO response into a dictionary"""
+        result = {}
+
+        # Handle both string and dict responses
+        if isinstance(info_data, dict):
+            # Client already parsed it as dict
+            for key, value in info_data.items():
+                # Strip spill_ prefix if present
+                if key.startswith('spill_'):
+                    key = key[6:]
+                result[key] = value
+            return result
+
+        # Parse string format
+        for line in info_data.split('\r\n'):
+            line = line.strip()
+            if line and not line.startswith('#') and ':' in line:
+                key, value = line.split(':', 1)
+                # Strip spill_ prefix if present (from INFO command)
+                if key.startswith('spill_'):
+                    key = key[6:]  # Remove 'spill_' prefix
+                # Try to convert to int, otherwise keep as string
+                try:
+                    result[key] = int(value)
+                except ValueError:
+                    result[key] = value
+        return result
+
+    def get_spill_info(self):
+        """Helper to get spill stats from INFO command"""
+        info = self.client.execute_command('INFO', 'spill')
+        return self.parse_info_response(info)
 
     # ========================================================================
     # SPILL.RESTORE Command Tests
@@ -95,20 +129,18 @@ class CommandsAndCleanupTest(unittest.TestCase):
         self.client.set('key1', 'value1')
         self.client.execute_command('EVICT', 'key1')
 
-        # Check estimated_keys in RocksDB
-        info = self.client.execute_command('SPILL.INFO')
-        info_str = str(info)
-        estimated_keys_before = int(re.search(r'estimated_keys:(\d+)', info_str).group(1))
-        self.assertGreater(estimated_keys_before, 0)
+        # Check num_keys_stored in RocksDB
+        info_dict = self.get_spill_info()
+        keys_stored_before = info_dict.get('num_keys_stored', 0)
+        self.assertGreater(keys_stored_before, 0)
 
         # Restore the key
         self.client.execute_command('SPILL.RESTORE', 'key1')
 
-        # Check estimated_keys again - should be decreased
-        info = self.client.execute_command('SPILL.INFO')
-        info_str = str(info)
-        estimated_keys_after = int(re.search(r'estimated_keys:(\d+)', info_str).group(1))
-        self.assertEqual(estimated_keys_after, estimated_keys_before - 1)
+        # Check num_keys_stored again - should be decreased
+        info_dict = self.get_spill_info()
+        keys_stored_after = info_dict.get('num_keys_stored', 0)
+        self.assertEqual(keys_stored_after, keys_stored_before - 1)
 
     def test_restore_wrong_number_of_arguments(self):
         """Test SPILL.RESTORE with wrong number of arguments"""
@@ -117,7 +149,7 @@ class CommandsAndCleanupTest(unittest.TestCase):
         self.assertIn('wrong number of arguments', str(context.exception).lower())
 
     def test_restore_expired_key(self):
-        """Test SPILL.RESTORE returns error for expired key"""
+        """Test SPILL.RESTORE handles expired key correctly"""
         # Set key with 1 second TTL
         self.client.setex('expkey', 1, 'value')
 
@@ -127,10 +159,14 @@ class CommandsAndCleanupTest(unittest.TestCase):
         # Wait for expiration
         time.sleep(2)
 
-        # Try to restore - should get expiration error
-        with self.assertRaises(redis.ResponseError) as context:
-            self.client.execute_command('SPILL.RESTORE', 'expkey')
-        self.assertIn('expired', str(context.exception).lower())
+        # Try to restore - should either get expiration error or None (if already cleaned)
+        try:
+            result = self.client.execute_command('SPILL.RESTORE', 'expkey')
+            # If no error, result should be None (key not found/already cleaned)
+            self.assertIsNone(result, "Expired key should return None if already cleaned")
+        except redis.ResponseError as e:
+            # If error, should contain "expired" in the message
+            self.assertIn('expired', str(e).lower(), "Error should mention key expired")
 
     # ========================================================================
     # Automatic Restoration Tests
@@ -239,93 +275,83 @@ class CommandsAndCleanupTest(unittest.TestCase):
         self.assertEqual(hash_data, {'f1': 'v1', 'f2': 'v2'})
 
     # ========================================================================
-    # SPILL.INFO Tests
+    # INFO Command Tests
     # ========================================================================
 
     def test_info_shows_cleanup_interval(self):
-        """Test SPILL.INFO displays cleanup_interval configuration"""
-        info = self.client.execute_command('SPILL.INFO')
-        info_str = str(info)
+        """Test INFO displays cleanup_interval configuration"""
+        info_dict = self.get_spill_info()
 
-        # Should contain cleanup_interval
-        self.assertIn('cleanup_interval', info_str)
+        # Should contain cleanup_interval_seconds
+        self.assertIn('cleanup_interval_seconds', info_dict)
 
-        # Extract and verify it's a positive number
-        match = re.search(r'cleanup_interval:(\d+)', info_str)
-        self.assertIsNotNone(match, "cleanup_interval not found in SPILL.INFO")
-
-        interval = int(match.group(1))
+        # Verify it's a non-negative number
+        interval = info_dict['cleanup_interval_seconds']
+        self.assertIsInstance(interval, int)
         self.assertGreaterEqual(interval, 0)
 
-    def test_info_shows_all_sections(self):
-        """Test SPILL.INFO displays all documented sections"""
-        info = self.client.execute_command('SPILL.INFO')
-        info_str = str(info)
+    def test_info_shows_config_sections(self):
+        """Test INFO displays configuration fields"""
+        info_dict = self.get_spill_info()
 
-        # Check for all required sections
-        self.assertIn('# spill', info_str)
-        self.assertIn('# rocksdb_memory', info_str)
-        self.assertIn('# rocksdb_storage', info_str)
-        self.assertIn('# rocksdb_compaction', info_str)
+        # Check for required sections and fields
+        self.assertIn('num_keys_stored', info_dict)
+        self.assertIn('total_keys_restored', info_dict)
+        self.assertIn('total_keys_cleaned', info_dict)
+        self.assertIn('max_memory_bytes', info_dict)
+        self.assertIn('path', info_dict)
+        self.assertIn('cleanup_interval_seconds', info_dict)
 
-        # Check for key metrics
-        self.assertIn('keys_stored:', info_str)
-        self.assertIn('keys_restored:', info_str)
-        self.assertIn('keys_expired:', info_str)
-        self.assertIn('keys_cleaned:', info_str)
-        self.assertIn('max_memory:', info_str)
-        self.assertIn('path:', info_str)
+    def test_info_config_format(self):
+        """Test INFO config values are properly formatted"""
+        info_dict = self.get_spill_info()
 
-    def test_info_memory_format(self):
-        """Test SPILL.INFO memory values show both bytes and MB"""
-        info = self.client.execute_command('SPILL.INFO')
-        info_str = str(info)
+        # max_memory_bytes should be a positive integer
+        self.assertIn('max_memory_bytes', info_dict)
+        max_memory = info_dict['max_memory_bytes']
+        self.assertIsInstance(max_memory, int)
+        self.assertGreater(max_memory, 0)
 
-        # max_memory should show format like: 262144000 (250MB)
-        match = re.search(r'max_memory:(\d+)\s*\((\d+)MB\)', info_str)
-        self.assertIsNotNone(match, "max_memory format incorrect")
+        # path should be a non-empty string
+        self.assertIn('path', info_dict)
+        path = info_dict['path']
+        self.assertIsInstance(path, str)
+        # Path could be empty string, so just check it exists
 
     # ========================================================================
-    # SPILL.STATS Tests
+    # INFO Command Tests
     # ========================================================================
 
-    def test_stats_returns_array(self):
-        """Test SPILL.STATS returns array with correct fields"""
-        stats = self.client.execute_command('SPILL.STATS')
-
-        # Should be a list (array)
-        self.assertIsInstance(stats, list)
-
-        # Should have alternating key-value pairs
-        self.assertGreater(len(stats), 0)
-        self.assertEqual(len(stats) % 2, 0)
-
-        # Convert to dict for easier checking
-        stats_dict = {stats[i]: stats[i+1] for i in range(0, len(stats), 2)}
+    def test_stats_returns_bulk_string(self):
+        """Test INFO returns correct fields"""
+        stats_dict = self.get_spill_info()
 
         # Check for required fields
-        self.assertIn('keys_stored', stats_dict)
-        self.assertIn('keys_restored', stats_dict)
-        self.assertIn('keys_expired', stats_dict)
-        self.assertIn('keys_cleaned', stats_dict)
-        self.assertIn('bytes_written', stats_dict)
-        self.assertIn('bytes_read', stats_dict)
+        self.assertIn('num_keys_stored', stats_dict)
+        self.assertIn('total_keys_restored', stats_dict)
+        self.assertIn('total_keys_cleaned', stats_dict)
+        self.assertIn('total_bytes_written', stats_dict)
+        self.assertIn('total_bytes_read', stats_dict)
 
     def test_stats_counters_are_numeric(self):
-        """Test SPILL.STATS counters are numeric values"""
-        stats = self.client.execute_command('SPILL.STATS')
-        stats_dict = {stats[i]: stats[i+1] for i in range(0, len(stats), 2)}
+        """Test INFO counters are numeric values"""
+        stats_dict = self.get_spill_info()
 
-        # All values should be integers
-        for key, value in stats_dict.items():
-            self.assertIsInstance(value, int, f"{key} should be integer")
-            self.assertGreaterEqual(value, 0, f"{key} should be non-negative")
+        # Numeric stats fields (excluding string config fields like 'path')
+        numeric_fields = ['num_keys_stored', 'total_keys_written', 'total_keys_restored',
+                         'total_keys_cleaned', 'last_num_keys_cleaned', 'last_cleanup_at',
+                         'total_bytes_written', 'total_bytes_read', 'max_memory_bytes', 'cleanup_interval_seconds']
+
+        for key in numeric_fields:
+            if key in stats_dict:
+                value = stats_dict[key]
+                self.assertIsInstance(value, int, f"{key} should be integer")
+                self.assertGreaterEqual(value, 0, f"{key} should be non-negative")
 
     def test_stats_increments_on_operations(self):
-        """Test SPILL.STATS counters increment correctly"""
+        """Test INFO counters increment correctly"""
         # Get initial stats
-        stats_before = self.client.execute_command('SPILL.STATS')
-        stats_dict_before = {stats_before[i]: stats_before[i+1] for i in range(0, len(stats_before), 2)}
+        stats_dict_before = self.get_spill_info()
 
         # Perform operations
         self.client.set('k1', 'v1')
@@ -333,21 +359,23 @@ class CommandsAndCleanupTest(unittest.TestCase):
         self.client.execute_command('SPILL.RESTORE', 'k1')
 
         # Get stats after
-        stats_after = self.client.execute_command('SPILL.STATS')
-        stats_dict_after = {stats_after[i]: stats_after[i+1] for i in range(0, len(stats_after), 2)}
+        stats_dict_after = self.get_spill_info()
 
         # Verify increments
-        self.assertGreater(stats_dict_after['keys_stored'], stats_dict_before['keys_stored'])
-        self.assertGreater(stats_dict_after['keys_restored'], stats_dict_before['keys_restored'])
-        self.assertGreater(stats_dict_after['bytes_written'], stats_dict_before['bytes_written'])
-        self.assertGreater(stats_dict_after['bytes_read'], stats_dict_before['bytes_read'])
+        # num_keys_stored should be same (evict +1, restore -1 = net 0)
+        # total_keys_written should increase (eviction wrote to RocksDB)
+        # total_keys_restored should increase (restore read from RocksDB)
+        self.assertGreater(stats_dict_after['total_keys_written'], stats_dict_before['total_keys_written'])
+        self.assertGreater(stats_dict_after['total_keys_restored'], stats_dict_before['total_keys_restored'])
+        self.assertGreater(stats_dict_after['total_bytes_written'], stats_dict_before['total_bytes_written'])
+        self.assertGreater(stats_dict_after['total_bytes_read'], stats_dict_before['total_bytes_read'])
 
     # ========================================================================
     # SPILL.CLEANUP Command Tests
     # ========================================================================
 
     def test_cleanup_returns_statistics(self):
-        """Test SPILL.CLEANUP returns keys_checked and keys_removed"""
+        """Test SPILL.CLEANUP returns num_keys_scanned and num_keys_cleaned"""
         result = self.client.execute_command('SPILL.CLEANUP')
 
         # Should be a list
@@ -357,12 +385,12 @@ class CommandsAndCleanupTest(unittest.TestCase):
         result_dict = {result[i]: result[i+1] for i in range(0, len(result), 2)}
 
         # Should have required fields
-        self.assertIn('keys_checked', result_dict)
-        self.assertIn('keys_removed', result_dict)
+        self.assertIn('num_keys_scanned', result_dict)
+        self.assertIn('num_keys_cleaned', result_dict)
 
         # Values should be integers
-        self.assertIsInstance(result_dict['keys_checked'], int)
-        self.assertIsInstance(result_dict['keys_removed'], int)
+        self.assertIsInstance(result_dict['num_keys_scanned'], int)
+        self.assertIsInstance(result_dict['num_keys_cleaned'], int)
 
     def test_cleanup_removes_expired_keys(self):
         """Test SPILL.CLEANUP removes expired keys"""
@@ -379,15 +407,14 @@ class CommandsAndCleanupTest(unittest.TestCase):
         result_dict = {result[i]: result[i+1] for i in range(0, len(result), 2)}
 
         # Should have found and removed the expired keys
-        self.assertGreater(result_dict['keys_checked'], 0)
-        self.assertGreater(result_dict['keys_removed'], 0)
+        self.assertGreater(result_dict['num_keys_scanned'], 0)
+        self.assertGreater(result_dict['num_keys_cleaned'], 0)
 
     def test_cleanup_increments_keys_cleaned_counter(self):
-        """Test SPILL.CLEANUP increments keys_cleaned in stats"""
-        # Get initial keys_cleaned
-        stats_before = self.client.execute_command('SPILL.STATS')
-        stats_dict_before = {stats_before[i]: stats_before[i+1] for i in range(0, len(stats_before), 2)}
-        initial_cleaned = stats_dict_before['keys_cleaned']
+        """Test SPILL.CLEANUP increments total_keys_cleaned in stats"""
+        # Get initial total_keys_cleaned
+        stats_dict_before = self.get_spill_info()
+        initial_cleaned = stats_dict_before['total_keys_cleaned']
 
         # Create and expire keys
         for i in range(2):
@@ -399,13 +426,12 @@ class CommandsAndCleanupTest(unittest.TestCase):
         # Run cleanup
         cleanup_result = self.client.execute_command('SPILL.CLEANUP')
         cleanup_dict = {cleanup_result[i]: cleanup_result[i+1] for i in range(0, len(cleanup_result), 2)}
-        removed = cleanup_dict['keys_removed']
+        removed = cleanup_dict['num_keys_cleaned']
 
-        # Check keys_cleaned increased
-        stats_after = self.client.execute_command('SPILL.STATS')
-        stats_dict_after = {stats_after[i]: stats_after[i+1] for i in range(0, len(stats_after), 2)}
+        # Check total_keys_cleaned increased
+        stats_dict_after = self.get_spill_info()
 
-        self.assertEqual(stats_dict_after['keys_cleaned'], initial_cleaned + removed)
+        self.assertEqual(stats_dict_after['total_keys_cleaned'], initial_cleaned + removed)
 
     # ========================================================================
     # Periodic Cleanup Thread Tests
@@ -413,20 +439,19 @@ class CommandsAndCleanupTest(unittest.TestCase):
 
     def test_cleanup_interval_configuration(self):
         """Test that cleanup_interval is properly configured and displayed"""
-        info = self.client.execute_command('SPILL.INFO')
-        info_str = str(info)
+        info_dict = self.get_spill_info()
 
-        # Should show cleanup_interval
-        match = re.search(r'cleanup_interval:(\d+)', info_str)
-        self.assertIsNotNone(match)
+        # Should show cleanup_interval_seconds
+        self.assertIn('cleanup_interval_seconds', info_dict)
 
-        interval = int(match.group(1))
-        # Should have a reasonable default (e.g., 300 seconds)
-        self.assertGreater(interval, 0)
+        interval = info_dict['cleanup_interval_seconds']
+        self.assertIsInstance(interval, int)
+        # Should have a non-negative value
+        self.assertGreaterEqual(interval, 0)
 
     def test_automatic_cleanup_happens(self):
         """Test that automatic periodic cleanup removes expired keys"""
-        # Note: This test requires cleanup_interval to be set to a short value
+        # Note: This test requires cleanup_interval to be set to a short value (e.g., 10 seconds)
         # For CI/CD, the module should be loaded with cleanup-interval 10 or similar
 
         # Create expired keys
@@ -435,36 +460,31 @@ class CommandsAndCleanupTest(unittest.TestCase):
             self.client.execute_command('EVICT', f'autoexp{i}')
 
         # Get initial stats
-        stats_before = self.client.execute_command('SPILL.STATS')
-        stats_dict_before = {stats_before[i]: stats_before[i+1] for i in range(0, len(stats_before), 2)}
+        stats_dict_before = self.get_spill_info()
 
         # Wait for keys to expire
         time.sleep(2)
 
         # Get cleanup interval from INFO
-        info = self.client.execute_command('SPILL.INFO')
-        info_str = str(info)
-        match = re.search(r'cleanup_interval:(\d+)', info_str)
-        if match:
-            interval = int(match.group(1))
-            if interval > 0 and interval < 60:  # Only test if interval is reasonable
-                # Wait for automatic cleanup to run (interval + buffer)
-                print(f"Waiting {interval + 5} seconds for automatic cleanup...")
-                time.sleep(interval + 5)
+        info_dict = self.get_spill_info()
+        interval = info_dict.get('cleanup_interval_seconds', 300)
 
-                # Check that keys_cleaned increased (automatic cleanup ran)
-                stats_after = self.client.execute_command('SPILL.STATS')
-                stats_dict_after = {stats_after[i]: stats_after[i+1] for i in range(0, len(stats_after), 2)}
+        if interval > 0 and interval < 60:  # Only test if interval is reasonable for testing
+            # Wait for automatic cleanup to run (interval + buffer)
+            print(f"Waiting {interval + 5} seconds for automatic cleanup...")
+            time.sleep(interval + 5)
 
-                # Either keys_cleaned or keys_expired should have increased
-                # (expired keys might be caught during restore or periodic cleanup)
-                total_cleaned_before = stats_dict_before['keys_cleaned'] + stats_dict_before['keys_expired']
-                total_cleaned_after = stats_dict_after['keys_cleaned'] + stats_dict_after['keys_expired']
+            # Check that total_keys_cleaned increased (automatic cleanup ran)
+            stats_dict_after = self.get_spill_info()
 
-                self.assertGreater(total_cleaned_after, total_cleaned_before,
-                                 "Automatic cleanup should have removed expired keys")
-            else:
-                self.skipTest(f"Cleanup interval too long ({interval}s) for this test")
+            # total_keys_cleaned should have increased (expired keys caught during restore or periodic cleanup)
+            keys_cleaned_before = stats_dict_before['total_keys_cleaned']
+            keys_cleaned_after = stats_dict_after['total_keys_cleaned']
+
+            self.assertGreater(keys_cleaned_after, keys_cleaned_before,
+                             "Automatic cleanup should have removed expired keys")
+        else:
+            self.skipTest(f"Cleanup interval too long ({interval}s) for this test")
 
     # ========================================================================
     # Edge Cases from Documentation

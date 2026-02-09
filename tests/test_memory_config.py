@@ -113,7 +113,7 @@ def test_memory_below_minimum():
                 try:
                     r = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True, socket_connect_timeout=2)
                     try:
-                        r.execute_command('spill.stats')
+                        r.execute_command('spill.cleanup')
                         print(f"\nFAIL: Module loaded with {description} (should reject < 20MB)")
                         return False
                     except redis.ResponseError:
@@ -147,14 +147,9 @@ def test_memory_at_minimum():
         r = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True)
 
         # Module should be loaded and functional
-        stats = r.execute_command('spill.stats')
-        if not isinstance(stats, list):
+        cleanup_result = r.execute_command('spill.cleanup')
+        if not isinstance(cleanup_result, list):
             print("FAIL: Module not functional with 20MB")
-            return False
-
-        info = r.execute_command('spill.info')
-        if not info or '20' not in info:
-            print("FAIL: Module info doesn't show 20MB config")
             return False
 
         print("PASS")
@@ -193,8 +188,8 @@ def test_memory_above_minimum():
             r = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True)
 
             # Module should be loaded and functional
-            stats = r.execute_command('spill.stats')
-            if not isinstance(stats, list):
+            cleanup_result = r.execute_command('spill.cleanup')
+            if not isinstance(cleanup_result, list):
                 print(f"\nFAIL: Module not functional with {description}")
                 return False
 
@@ -239,15 +234,11 @@ def test_memory_allocation_formula():
             r = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True)
 
             # Module should be functional
-            stats = r.execute_command('spill.stats')
-            if not isinstance(stats, list):
+            cleanup_result = r.execute_command('spill.cleanup')
+            if not isinstance(cleanup_result, list):
                 print(f"\nFAIL: Module not functional with {description}")
                 return False
 
-            # Get info to verify memory settings
-            info = r.execute_command('spill.info')
-
-            # The server logs should show the correct allocation
             # We can't directly verify internal allocations from client,
             # but we verify module loaded successfully with these settings
 

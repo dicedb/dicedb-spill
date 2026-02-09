@@ -13,13 +13,55 @@ Spill module persists evicted keys to RocksDB, expanding cache capacity onto dis
 
 ## Quick Start
 
+The quickest and easiest way to see dicedb-spill in action is by using the official Docker image of DiceDB which comes with everything pre-configured.
+
+```bash
+docker run \
+  --name dicedb-1 -p 6379:6379 -v $(pwd)/data:/data/ \
+  dicedb:latest
+```
+
+This command starts a DiceDB container with the `spill` module already enabled. By default, the spill module uses RocksDB and is configured with a maximum memory limit of 250MB.
+
+### Custom Configuration
+
+```bash
+docker run \
+    --name dicedb-1 -p 6379:6379 -v $(pwd)/data:/data/ \
+    dicedb:latest \
+    dicedb-server \
+    --protected-mode no \
+    --loadmodule /usr/local/lib/lib-spill.so path /data/spill/ max-memory 262144000 cleanup-interval 200
+```
+
+## Spill in Action
+
+Once the DiceDB server is running with spill module loaded,
+run the following commands which - sets a key, evicts a key,
+and when we try to access it (via `GET`) it trasparently
+loads it in memory.
+
+```
+SET k1 v1
+EVICT k1
+KEYS *
+GET k1
+```
+
+## Documentation
+
+- [Configuration Reference](docs/configuration.md)
+- [Commands Reference](docs/commands.md)
+
+
+## Development
+
 ### Cloning
 
-This repository is intended to be used as a submodule and must be located at `modules/dicedb-spill` inside the DiceDB repository.
+This repository is intended to be used as a submodule and must be located at `modules/dicedb-spill` inside the DiceDB repository and please clone [dicedb/dicedb](https://github.com/dicedb/dicedb) repository with
+a `--recursive` flag and then init the git submodule.
 
-### Prerequisites
-
-Install RocksDB (requires root or sudo access):
+### Install RocksDB
 
 ```bash
 # Basic build (portable, no compression)
@@ -48,23 +90,6 @@ $ make
 $ make ENABLE_COMPRESSION=1
 ```
 
-### Basic Configuration
-
-```bash
-$ dicedb-server -p 6379 \
-    --loadmodule ./modules/dicedb-spill/lib-spill.so \
-    path /tmp/data/spill \
-    max-memory 268435456 \
-    cleanup-interval 300
-```
-
-Note: The module automatically uses Snappy compression. For optimal disk usage, RocksDB should be built with compression enabled (`ENABLE_COMPRESSION=1`).
-
-## Documentation
-
-- [Configuration Reference](docs/configuration.md)
-- [Commands Reference](docs/commands.md)
-
 ## Tests
 
 Start the DiceDB server with the Spill module loaded:
@@ -72,7 +97,7 @@ Start the DiceDB server with the Spill module loaded:
 ```bash
 ./src/dicedb-server \
     --loadmodule ./modules/dicedb-spill/lib-spill.so \
-    path /tmp/data/spill max-memory 256 cleanup-interval 300
+    path /tmp/data max-memory 256 cleanup-interval 300
 ```
 
 Run the test suite:

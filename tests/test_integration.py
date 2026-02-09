@@ -45,7 +45,7 @@ def check_server_running():
         r = redis.Redis(host='localhost', port=REDIS_PORT, socket_connect_timeout=2, socket_timeout=2)
         r.ping()
         try:
-            r.execute_command('spill.info')
+            r.execute_command('spill.cleanup')
             return True
         except redis.ResponseError as e:
             if 'unknown command' in str(e).lower():
@@ -215,22 +215,22 @@ def test_multiple_evictions_and_restores():
     assert restored > 0, f"No keys were restored out of {len(evicted)} evicted"
     print(f"  {restored}/{len(evicted)} keys successfully restored")
 
-def test_spill_info_command():
-    """Test the spill.info command"""
+def test_spill_cleanup_command():
+    """Test the spill.cleanup command"""
     r = redis.Redis(host='localhost', port=REDIS_PORT, decode_responses=True)
 
     # Trigger some evictions first
     for i in range(100):
-        r.set(f'info_key_{i}', 'info_value' * 100)
+        r.set(f'cleanup_key_{i}', 'cleanup_value' * 100)
 
     for i in range(1000):
-        r.set(f'filler_info_{i}', 'b' * 5000)
+        r.set(f'filler_cleanup_{i}', 'b' * 5000)
 
-    # Get RocksDB stats
-    stats = r.execute_command('spill.info')
-    assert stats is not None, "spill.info returned None"
-    assert len(stats) > 0, "spill.info returned empty stats"
-    assert 'rocksdb' in stats.lower() or 'level' in stats.lower(), "Stats don't look like RocksDB stats"
+    # Run cleanup
+    result = r.execute_command('spill.cleanup')
+    assert result is not None, "spill.cleanup returned None"
+    assert isinstance(result, list), "spill.cleanup should return list"
+    assert len(result) == 4, "spill.cleanup should return 4 elements"
 
 def test_key_with_spaces_and_special_chars():
     """Test keys with spaces and special characters"""
@@ -724,7 +724,7 @@ def main():
         (test_expired_key_not_restored, "Expired key not restored"),
         (test_restore_nonexistent_key, "Restore nonexistent key"),
         (test_multiple_evictions_and_restores, "Multiple evictions and restores"),
-        (test_spill_info_command, "Spill info command"),
+        (test_spill_cleanup_command, "Spill cleanup command"),
         (test_key_with_spaces_and_special_chars, "Keys with special characters"),
         (test_double_restore, "Double restore removes from RocksDB"),
         (test_large_value, "Large value eviction and restore"),

@@ -5,7 +5,7 @@
 | Parameter | Required | Default | Purpose |
 |-----------|----------|---------|---------|
 | `path` | Yes | - | RocksDB data directory path |
-| `max-memory` | No | 256MB | Maximum memory budget for RocksDB (block cache + write buffers). Minimum: 20MB |
+| `max-memory` | No | 256MB | Maximum memory budget for RocksDB. Minimum: 20MB |
 | `cleanup-interval` | No | 300 seconds | Interval between automatic cleanup runs for expired keys. Set to 0 to disable periodic cleanup |
 
 ## Parameter Details

@@ -21,7 +21,7 @@ if ! python3 -c "import redis; redis.Redis(host='localhost', port=6379).ping()" 
     exit 1
 fi
 
-if ! python3 -c "import redis; r = redis.Redis(host='localhost', port=6379); r.execute_command('spill.stats')" 2>/dev/null; then
+if ! python3 -c "import redis; r = redis.Redis(host='localhost', port=6379); r.execute_command('spill.cleanup')" 2>/dev/null; then
     echo "Error: Spill module not loaded"
     [ $SHOULD_DEACTIVATE -eq 1 ] && deactivate
     exit 1

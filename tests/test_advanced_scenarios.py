@@ -30,6 +30,40 @@ except ImportError:
 # Test configuration
 TEST_PORT = 6379
 
+def parse_info_response(info_data):
+    """Helper to parse INFO response into a dictionary"""
+    result = {}
+
+    # Handle both string and dict responses
+    if isinstance(info_data, dict):
+        # Client already parsed it as dict
+        for key, value in info_data.items():
+            # Strip spill_ prefix if present
+            if key.startswith('spill_'):
+                key = key[6:]
+            result[key] = value
+        return result
+
+    # Parse string format
+    for line in info_data.split('\r\n'):
+        line = line.strip()
+        if line and not line.startswith('#') and ':' in line:
+            key, value = line.split(':', 1)
+            # Strip spill_ prefix if present (from INFO command)
+            if key.startswith('spill_'):
+                key = key[6:]  # Remove 'spill_' prefix
+            # Try to convert to int, otherwise keep as string
+            try:
+                result[key] = int(value)
+            except ValueError:
+                result[key] = value
+    return result
+
+def get_spill_info(client):
+    """Helper to get spill stats from INFO command"""
+    info = client.execute_command('INFO', 'spill')
+    return parse_info_response(info)
+
 def run_test(test_func, test_name):
     try:
         print(f"{test_name}...", end=" ")
@@ -104,8 +138,7 @@ def test_direct_write_operations_stress():
         test_keys.append((key, value))
 
     # Get initial stats
-    initial_stats = r.execute_command('spill.stats')
-    initial_dict = {initial_stats[i]: initial_stats[i+1] for i in range(0, len(initial_stats), 2)}
+    initial_dict = get_spill_info(r)
 
     # Force rapid evictions to stress direct write system
     for i in range(2000):
@@ -114,11 +147,10 @@ def test_direct_write_operations_stress():
     time.sleep(0.5)  # Allow direct write operations to complete
 
     # Check that direct write operations occurred
-    final_stats = r.execute_command('spill.stats')
-    final_dict = {final_stats[i]: final_stats[i+1] for i in range(0, len(final_stats), 2)}
+    final_dict = get_spill_info(r)
 
-    keys_stored = final_dict['keys_stored'] - initial_dict['keys_stored']
-    bytes_written = final_dict['bytes_written'] - initial_dict['bytes_written']
+    keys_stored = final_dict['num_keys_stored'] - initial_dict['num_keys_stored']
+    bytes_written = final_dict['total_bytes_written'] - initial_dict['total_bytes_written']
 
     # Be more flexible with thresholds since eviction behavior varies by server
     assert keys_stored >= 0, f"Keys stored should be non-negative, got {keys_stored}"
@@ -242,8 +274,8 @@ def test_rocksdb_error_conditions():
     error_commands = [
         ('spill.restore', ['nonexistent_key']),
         ('spill.cleanup', []),
-        ('spill.info', []),
-        ('spill.stats', [])
+        ('INFO', ['spill']),
+        ('INFO', ['spill'])
     ]
 
     for cmd, args in error_commands:
@@ -313,7 +345,7 @@ def test_concurrent_access_patterns():
                 # Randomly check stats
                 if random.random() > 0.9:
                     try:
-                        client.execute_command('spill.stats')
+                        get_spill_info(client)
                     except:
                         pass
 
@@ -331,8 +363,8 @@ def test_concurrent_access_patterns():
         t.join()
 
     # Verify system stability
-    final_stats = r.execute_command('spill.stats')
-    assert isinstance(final_stats, list), "Stats should work after concurrent access"
+    final_stats = get_spill_info(r)
+    assert isinstance(final_stats, dict), "Stats should work after concurrent access"
 
     print(f"  Concurrent access: {results['success']} successful operations, {len(results['errors'])} errors")
     assert len(results['errors']) < 10, "Too many errors in concurrent access"
@@ -467,8 +499,8 @@ def test_security_boundary_conditions():
         pass  # System should handle or reject gracefully
 
     # Verify system is still responsive
-    stats = r.execute_command('spill.stats')
-    assert isinstance(stats, list), "System should remain responsive after security tests"
+    stats = get_spill_info(r)
+    assert isinstance(stats, dict), "System should remain responsive after security tests"
 
     print("  ✓ Security boundary conditions handled appropriately")
 
@@ -493,8 +525,7 @@ def test_cleanup_command():
     time.sleep(3)
 
     # Get stats before cleanup
-    initial_stats = r.execute_command('spill.stats')
-    initial_dict = {initial_stats[i]: initial_stats[i+1] for i in range(0, len(initial_stats), 2)}
+    initial_dict = get_spill_info(r)
 
     # Run cleanup command
     cleanup_result = r.execute_command('spill.cleanup')
@@ -502,21 +533,19 @@ def test_cleanup_command():
     cleanup_dict = {cleanup_result[i]: cleanup_result[i+1] for i in range(0, len(cleanup_result), 2)}
 
     # Check that cleanup found and removed keys
-    assert 'keys_checked' in cleanup_dict, "Cleanup should report keys_checked"
-    assert 'keys_removed' in cleanup_dict, "Cleanup should report keys_removed"
-    assert cleanup_dict['keys_checked'] >= 0, "keys_checked should be non-negative"
-    assert cleanup_dict['keys_removed'] >= 0, "keys_removed should be non-negative"
+    assert 'num_keys_scanned' in cleanup_dict, "Cleanup should report num_keys_scanned"
+    assert 'num_keys_cleaned' in cleanup_dict, "Cleanup should report num_keys_cleaned"
+    assert cleanup_dict['num_keys_scanned'] >= 0, "num_keys_scanned should be non-negative"
+    assert cleanup_dict['num_keys_cleaned'] >= 0, "num_keys_cleaned should be non-negative"
 
     # Get stats after cleanup
-    final_stats = r.execute_command('spill.stats')
-    final_dict = {final_stats[i]: final_stats[i+1] for i in range(0, len(final_stats), 2)}
+    final_dict = get_spill_info(r)
 
-    # Verify keys_expired and keys_cleaned stats were updated
-    keys_expired_delta = final_dict['keys_expired'] - initial_dict['keys_expired']
-    keys_cleaned_delta = final_dict['keys_cleaned'] - initial_dict['keys_cleaned']
+    # Verify total_keys_cleaned stat was updated
+    keys_cleaned_delta = final_dict['total_keys_cleaned'] - initial_dict['total_keys_cleaned']
 
-    print(f"  Cleanup: checked={cleanup_dict['keys_checked']}, removed={cleanup_dict['keys_removed']}, " +
-          f"expired_stat_delta={keys_expired_delta}, cleaned_stat_delta={keys_cleaned_delta}")
+    print(f"  Cleanup: checked={cleanup_dict['num_keys_scanned']}, removed={cleanup_dict['num_keys_cleaned']}, " +
+          f"cleaned_stat_delta={keys_cleaned_delta}")
 
 def test_expired_key_restoration():
     """Test that expired keys are properly detected and not restored"""
@@ -536,8 +565,7 @@ def test_expired_key_restoration():
     time.sleep(3)
 
     # Get stats before restore attempt
-    initial_stats = r.execute_command('spill.stats')
-    initial_dict = {initial_stats[i]: initial_stats[i+1] for i in range(0, len(initial_stats), 2)}
+    initial_dict = get_spill_info(r)
 
     # Try to restore expired key
     try:
@@ -549,14 +577,13 @@ def test_expired_key_restoration():
         assert 'expired' in str(e).lower(), f"Expected expiry error, got: {e}"
 
     # Get stats after restore attempt
-    final_stats = r.execute_command('spill.stats')
-    final_dict = {final_stats[i]: final_stats[i+1] for i in range(0, len(final_stats), 2)}
+    final_dict = get_spill_info(r)
 
-    # Verify keys_expired stat was incremented
-    keys_expired_delta = final_dict['keys_expired'] - initial_dict['keys_expired']
-    assert keys_expired_delta >= 0, f"keys_expired should not decrease, delta={keys_expired_delta}"
+    # Verify total_keys_cleaned stat may have been incremented
+    keys_cleaned_delta = final_dict['total_keys_cleaned'] - initial_dict['total_keys_cleaned']
+    assert keys_cleaned_delta >= 0, f"total_keys_cleaned should not decrease, delta={keys_cleaned_delta}"
 
-    print(f"  Expired key handling: keys_expired increased by {keys_expired_delta}")
+    print(f"  Expired key handling: total_keys_cleaned increased by {keys_cleaned_delta}")
 
 def main():
     """Main test runner for advanced scenarios"""

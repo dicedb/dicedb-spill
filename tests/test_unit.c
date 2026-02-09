@@ -633,12 +633,11 @@ TEST(error_message_constants) {
 
 // Test statistics tracking
 typedef struct {
-    uint64_t keys_stored;
-    uint64_t keys_restored;
-    uint64_t keys_expired;
-    uint64_t keys_cleaned;
-    uint64_t bytes_written;
-    uint64_t bytes_read;
+    uint64_t num_keys_stored;
+    uint64_t total_keys_restored;
+    uint64_t total_keys_cleaned;
+    uint64_t total_bytes_written;
+    uint64_t total_bytes_read;
 } MockStats;
 
 static MockStats mock_stats = {0};
@@ -648,33 +647,33 @@ TEST(stats_tracking_increments) {
     memset(&mock_stats, 0, sizeof(mock_stats));
 
     // Test basic increments
-    mock_stats.keys_stored++;
-    mock_stats.bytes_written += 1024;
+    mock_stats.num_keys_stored++;
+    mock_stats.total_bytes_written += 1024;
 
-    assert(mock_stats.keys_stored == 1);
-    assert(mock_stats.bytes_written == 1024);
-    assert(mock_stats.keys_restored == 0);
+    assert(mock_stats.num_keys_stored == 1);
+    assert(mock_stats.total_bytes_written == 1024);
+    assert(mock_stats.total_keys_restored == 0);
 
     // Test multiple increments
-    mock_stats.keys_restored += 5;
-    mock_stats.bytes_read += 2048;
+    mock_stats.total_keys_restored += 5;
+    mock_stats.total_bytes_read += 2048;
 
-    assert(mock_stats.keys_restored == 5);
-    assert(mock_stats.bytes_read == 2048);
+    assert(mock_stats.total_keys_restored == 5);
+    assert(mock_stats.total_bytes_read == 2048);
 }
 
 TEST(stats_overflow_handling) {
     // Test with large values
-    mock_stats.keys_stored = UINT64_MAX - 1;
-    mock_stats.keys_stored++; // Should wrap to UINT64_MAX
+    mock_stats.num_keys_stored = UINT64_MAX - 1;
+    mock_stats.num_keys_stored++; // Should wrap to UINT64_MAX
 
-    assert(mock_stats.keys_stored == UINT64_MAX);
+    assert(mock_stats.num_keys_stored == UINT64_MAX);
 
     // Test bytes counters with large values
-    mock_stats.bytes_written = 1000000000ULL;
-    mock_stats.bytes_written += 2000000000ULL;
+    mock_stats.total_bytes_written = 1000000000ULL;
+    mock_stats.total_bytes_written += 2000000000ULL;
 
-    assert(mock_stats.bytes_written == 3000000000ULL);
+    assert(mock_stats.total_bytes_written == 3000000000ULL);
 }
 
 int main() {

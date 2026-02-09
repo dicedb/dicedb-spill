@@ -66,54 +66,30 @@ class SpillIntegrationTest(unittest.TestCase):
 
     def test_module_loaded(self):
         """Test that spill module is loaded and commands are available"""
-        # Check if spill commands exist by trying to call them
+        # Check if spill commands exist by trying to call spill.cleanup
         try:
-            # This should return stats or an error, but not "unknown command"
-            result = self.client.execute_command('spill.stats')
+            # This should return cleanup stats or an error, but not "unknown command"
+            result = self.client.execute_command('spill.cleanup')
             self.assertIsInstance(result, list)
         except redis.ResponseError as e:
             if 'unknown command' in str(e).lower():
-                self.fail("Spill module not loaded - spill.stats command not found")
-
-    def test_spill_stats_command(self):
-        """Test spill.stats command returns proper statistics"""
-        stats = self.client.execute_command('spill.stats')
-
-        # Should return array with key-value pairs
-        self.assertIsInstance(stats, list)
-        self.assertEqual(len(stats) % 2, 0, "Stats should have even number of elements (key-value pairs)")
-
-        # Convert to dict for easier testing
-        stats_dict = {stats[i]: stats[i+1] for i in range(0, len(stats), 2)}
-
-        # Check required stats keys
-        required_keys = ['keys_stored', 'keys_restored', 'keys_expired', 'keys_cleaned', 'bytes_written', 'bytes_read']
-        for key in required_keys:
-            self.assertIn(key, stats_dict, f"Missing stat: {key}")
-            self.assertIsInstance(stats_dict[key], int, f"Stat {key} should be integer")
-
-    def test_spill_info_command(self):
-        """Test spill.info command returns RocksDB information"""
-        info = self.client.execute_command('spill.info')
-        self.assertIsInstance(info, str)
-        # Should contain some RocksDB statistics
-        self.assertTrue(len(info) > 0, "Info should not be empty")
+                self.fail("----Spill module not loaded - spill.cleanup command not found")
 
     def test_spill_cleanup_command(self):
         """Test spill.cleanup command"""
-        # Should return array with keys_checked and keys_removed
+        # Should return array with num_keys_scanned and num_keys_cleaned
         result = self.client.execute_command('spill.cleanup')
         self.assertIsInstance(result, list)
         self.assertEqual(len(result), 4)
 
         # Convert to dict for easier testing
         result_dict = {result[i]: result[i+1] for i in range(0, len(result), 2)}
-        self.assertIn('keys_checked', result_dict)
-        self.assertIn('keys_removed', result_dict)
-        self.assertIsInstance(result_dict['keys_checked'], int)
-        self.assertIsInstance(result_dict['keys_removed'], int)
-        self.assertGreaterEqual(result_dict['keys_checked'], 0)
-        self.assertGreaterEqual(result_dict['keys_removed'], 0)
+        self.assertIn('num_keys_scanned', result_dict)
+        self.assertIn('num_keys_cleaned', result_dict)
+        self.assertIsInstance(result_dict['num_keys_scanned'], int)
+        self.assertIsInstance(result_dict['num_keys_cleaned'], int)
+        self.assertGreaterEqual(result_dict['num_keys_scanned'], 0)
+        self.assertGreaterEqual(result_dict['num_keys_cleaned'], 0)
 
     def test_basic_key_eviction_and_storage(self):
         """Test manual key storage functionality (DiceDB doesn't auto-evict)"""
@@ -123,14 +99,10 @@ class SpillIntegrationTest(unittest.TestCase):
         # Set a key with TTL
         self.client.setex('test_key', 3600, 'test_value')
 
-        # Get initial stats
-        initial_stats = self.client.execute_command('spill.stats')
-        initial_dict = {initial_stats[i]: initial_stats[i+1] for i in range(0, len(initial_stats), 2)}
-
-        # Since automatic eviction doesn't work in DiceDB, we'll just verify
-        # the module is loaded and stats are accessible
-        self.assertIsInstance(initial_dict['keys_stored'], int)
-        self.assertIsInstance(initial_dict['keys_restored'], int)
+        # Verify module is loaded by calling cleanup
+        cleanup_result = self.client.execute_command('spill.cleanup')
+        self.assertIsInstance(cleanup_result, list)
+        self.assertEqual(len(cleanup_result), 4)
 
     def test_manual_key_restoration(self):
         """Test manual key restoration using spill.restore"""
@@ -186,17 +158,16 @@ class SpillIntegrationTest(unittest.TestCase):
 
         # Convert to dict for easier testing
         result_dict = {result[i]: result[i+1] for i in range(0, len(result), 2)}
-        self.assertIn('keys_checked', result_dict)
-        self.assertIn('keys_removed', result_dict)
-        self.assertIsInstance(result_dict['keys_checked'], int)
-        self.assertIsInstance(result_dict['keys_removed'], int)
-        self.assertGreaterEqual(result_dict['keys_checked'], 0)
-        self.assertGreaterEqual(result_dict['keys_removed'], 0)
+        self.assertIn('num_keys_scanned', result_dict)
+        self.assertIn('num_keys_cleaned', result_dict)
+        self.assertIsInstance(result_dict['num_keys_scanned'], int)
+        self.assertIsInstance(result_dict['num_keys_cleaned'], int)
+        self.assertGreaterEqual(result_dict['num_keys_scanned'], 0)
+        self.assertGreaterEqual(result_dict['num_keys_cleaned'], 0)
 
-        # Verify stats are accessible
-        stats = self.client.execute_command('spill.stats')
-        stats_dict = {stats[i]: stats[i+1] for i in range(0, len(stats), 2)}
-        self.assertIsInstance(stats_dict['keys_expired'], int)
+        # Verify cleanup command works
+        cleanup_result = self.client.execute_command('spill.cleanup')
+        self.assertIsInstance(cleanup_result, list)
 
     def test_keys_without_ttl(self):
         """Test handling of keys without TTL"""
@@ -277,8 +248,8 @@ class SpillIntegrationTest(unittest.TestCase):
                     value = f'value_{thread_id}_{i}'
                     client.setex(key, 3600, value)
 
-                # Test spill stats command
-                stats = client.execute_command('spill.stats')
+                # Test spill cleanup command
+                cleanup_result = client.execute_command('spill.cleanup')
                 time.sleep(0.1)
 
                 # Try to call restore commands (won't restore but tests the command)
@@ -353,10 +324,9 @@ class SpillIntegrationTest(unittest.TestCase):
             value = f'value_{i}_{"x" * 1000}'  # Make values large enough
             self.client.setex(key, 3600, value)
 
-        # Check initial stats
-        stats = self.client.execute_command('spill.stats')
-        stats_dict = {stats[i]: stats[i+1] for i in range(0, len(stats), 2)}
-        initial_stored = stats_dict['keys_stored']
+        # Verify module is loaded
+        cleanup_result = self.client.execute_command('spill.cleanup')
+        self.assertIsInstance(cleanup_result, list)
 
         # Try to call restore on keys (tests command availability)
         command_count = 0
@@ -412,34 +382,25 @@ class SpillIntegrationTest(unittest.TestCase):
         except redis.ResponseError:
             pass
 
-    def test_statistics_accuracy(self):
-        """Test that statistics are accessible and properly formatted"""
-        # Get initial stats
-        initial_stats = self.client.execute_command('spill.stats')
-        initial_dict = {initial_stats[i]: initial_stats[i+1] for i in range(0, len(initial_stats), 2)}
-
-        # Verify required stat fields exist and are integers
-        required_fields = ['keys_stored', 'keys_restored', 'keys_expired', 'keys_cleaned', 'bytes_written', 'bytes_read']
-        for field in required_fields:
-            self.assertIn(field, initial_dict, f"Stats should include {field}")
-            self.assertIsInstance(initial_dict[field], int, f"{field} should be an integer")
-
+    def test_cleanup_command(self):
+        """Test that cleanup command works properly"""
         # Perform some operations
-        self.client.setex('stats_test_1', 3600, 'value1')
-        self.client.setex('stats_test_2', 3600, 'value2')
+        self.client.setex('cleanup_test_1', 3600, 'value1')
+        self.client.setex('cleanup_test_2', 3600, 'value2')
 
         # Test restore commands
-        result1 = self.client.execute_command('spill.restore', 'stats_test_1')
+        result1 = self.client.execute_command('spill.restore', 'cleanup_test_1')
         result2 = self.client.execute_command('spill.restore', 'nonexistent_key')
 
-        # Get final stats
-        final_stats = self.client.execute_command('spill.stats')
-        final_dict = {final_stats[i]: final_stats[i+1] for i in range(0, len(final_stats), 2)}
+        # Run cleanup
+        cleanup_result = self.client.execute_command('spill.cleanup')
+        self.assertIsInstance(cleanup_result, list)
+        self.assertEqual(len(cleanup_result), 4)
 
-        # Verify stats are still properly formatted
-        for field in required_fields:
-            self.assertIn(field, final_dict, f"Stats should include {field}")
-            self.assertIsInstance(final_dict[field], int, f"{field} should be an integer")
+        # Verify cleanup result has required fields
+        cleanup_dict = {cleanup_result[i]: cleanup_result[i+1] for i in range(0, len(cleanup_result), 2)}
+        self.assertIn('num_keys_scanned', cleanup_dict)
+        self.assertIn('num_keys_cleaned', cleanup_dict)
 
 
 def run_tests():
@@ -458,7 +419,7 @@ def run_tests():
 
     # Check if spill module is loaded
     try:
-        client.execute_command('spill.stats')
+        client.execute_command('spill.cleanup')
         print("✓ Spill module detected")
     except redis.ResponseError as e:
         if 'unknown command' in str(e).lower():

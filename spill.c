@@ -29,12 +29,14 @@ static rocksdb_writeoptions_t *woptions = NULL;
 static ValkeyModuleCtx *module_ctx = NULL;
 
 typedef struct {
-    uint64_t keys_stored;
-    uint64_t keys_restored;
-    uint64_t keys_expired;
-    uint64_t keys_cleaned;
-    uint64_t bytes_written;
-    uint64_t bytes_read;
+    uint64_t num_keys_stored;      // Active keys in RocksDB (dynamically tracked: init at load, +1 on new key write, -1 on restore/cleanup)
+    uint64_t total_keys_written;   // Total write operations since server restart (cumulative, includes overwrites)
+    uint64_t total_keys_restored;  // Keys restored since server restart
+    uint64_t total_keys_cleaned;   // Cumulative keys cleaned since server restart (manual or automatic cleanup)
+    uint64_t last_num_keys_cleaned; // Keys cleaned in most recent cleanup job (manual or automatic)
+    int64_t last_cleanup_at;       // Unix timestamp (seconds) of last cleanup, 0 if never run
+    uint64_t total_bytes_written;  // Bytes written since server restart (includes metadata)
+    uint64_t total_bytes_read;     // Bytes read since server restart (includes metadata)
 } SpillStats;
 
 static SpillStats stats = {0};
@@ -114,7 +116,6 @@ static int RestoreKeyFromDB(ValkeyModuleCtx *ctx, ValkeyModuleString *key, const
         if (expiry_time_ms <= current_time_ms) {
             LOG(ctx, "notice", "spill: key=%.*s has expired (expiry=%lld, now=%lld), deleting",
                 (int)keylen, keyname, (long long)expiry_time_ms, (long long)current_time_ms);
-            __sync_fetch_and_add(&stats.keys_expired, 1);
             DeleteKeyFromDB(keyname, keylen);
             free(val);
             return -3;
@@ -143,9 +144,10 @@ static int RestoreKeyFromDB(ValkeyModuleCtx *ctx, ValkeyModuleString *key, const
     int result = 0;
     if (reply && ValkeyModule_CallReplyType(reply) != VALKEYMODULE_REPLY_ERROR) {
         LOG(ctx, "debug", "spill: key=%.*s restored successfully", (int)keylen, keyname);
-        __sync_fetch_and_add(&stats.keys_restored, 1);
-        __sync_fetch_and_add(&stats.bytes_read, vallen);
+        __sync_fetch_and_add(&stats.total_keys_restored, 1);
+        __sync_fetch_and_add(&stats.total_bytes_read, vallen);
         DeleteKeyFromDB(keyname, keylen);
+        __sync_fetch_and_sub(&stats.num_keys_stored, 1);
     } else {
         LOG(ctx, "warning", "spill: failed to restore key=%.*s: %s", (int)keylen, keyname,
             reply ? (ValkeyModule_CallReplyStringPtr(reply, NULL) ? ValkeyModule_CallReplyStringPtr(reply, NULL) : "no reply") : "no reply");
@@ -417,14 +419,26 @@ int PreevictionKeyNotification(ValkeyModuleCtx *ctx, int type, const char *event
     memcpy(ptr, dump_data, dump_len);
 
     LOG(ctx, "notice", "spill: storing key=%.*s directly to RocksDB", (int)keylen, keyname);
+
+    // Check if key already exists in RocksDB
+    size_t existing_len;
+    char *existing_err = NULL;
+    char *existing_val = rocksdb_get(db, roptions, keyname, keylen, &existing_len, &existing_err);
+    int is_new_key = (existing_val == NULL && existing_err == NULL);
+    if (existing_val) free(existing_val);
+    if (existing_err) free(existing_err);
+
     char *err = NULL;
     rocksdb_put(db, woptions, keyname, keylen, combined_data, total_len, &err);
     if (err != NULL) {
         LOG(ctx, "warning", "spill: failed to persist key=%.*s: %s", (int)keylen, keyname, err);
         free(err);
     } else {
-        __sync_fetch_and_add(&stats.keys_stored, 1);
-        __sync_fetch_and_add(&stats.bytes_written, total_len);
+        __sync_fetch_and_add(&stats.total_keys_written, 1);
+        __sync_fetch_and_add(&stats.total_bytes_written, total_len);
+        if (is_new_key) {
+            __sync_fetch_and_add(&stats.num_keys_stored, 1);
+        }
         LOG(ctx, "notice", "spill: stored key=%.*s (len=%zu) to RocksDB, size=%zu, expiry=%lld ms",
             (int)keylen, keyname, keylen, total_len, (long long)expiry_time_ms);
     }
@@ -496,13 +510,53 @@ static void *CleanupThreadFunc(void *arg) {
     return NULL;
 }
 
+// Counts active keys in RocksDB (excluding expired ones)
+static uint64_t CountActiveKeys() {
+    if (!db) return 0;
+
+    uint64_t active_keys = 0;
+    int64_t current_time_ms = (int64_t)time(NULL) * 1000;
+
+    rocksdb_iterator_t *iter = rocksdb_create_iterator(db, roptions);
+    rocksdb_iter_seek_to_first(iter);
+
+    while (rocksdb_iter_valid(iter)) {
+        size_t vallen;
+        const char *val = rocksdb_iter_value(iter, &vallen);
+
+        // Check if key is not expired
+        if (val && vallen >= sizeof(int64_t)) {
+            int64_t ttl_ms;
+            memcpy(&ttl_ms, val, sizeof(int64_t));
+
+            // Count keys that are either permanent (ttl_ms <= 0) or not expired
+            if (ttl_ms <= 0 || ttl_ms >= current_time_ms) {
+                active_keys++;
+            }
+        }
+
+        rocksdb_iter_next(iter);
+    }
+
+    char *err = NULL;
+    rocksdb_iter_get_error(iter, &err);
+    rocksdb_iter_destroy(iter);
+
+    if (err != NULL) {
+        LOG(module_ctx, "warning", "spill: error counting keys: %s", err);
+        free(err);
+    }
+
+    return active_keys;
+}
+
 // Performs cleanup of expired keys from RocksDB
 // Returns number of keys removed
 static uint64_t PerformCleanup() {
     if (!db) return 0;
 
-    uint64_t keys_checked = 0;
-    uint64_t keys_removed = 0;
+    uint64_t num_keys_scanned = 0;
+    uint64_t num_keys_cleaned = 0;
     int64_t current_time_ms = (int64_t)time(NULL) * 1000;
 
     rocksdb_iterator_t *iter = rocksdb_create_iterator(db, roptions);
@@ -513,7 +567,7 @@ static uint64_t PerformCleanup() {
         const char *keyname = rocksdb_iter_key(iter, &keylen);
         const char *val = rocksdb_iter_value(iter, &vallen);
 
-        keys_checked++;
+        num_keys_scanned++;
 
         // Check if value has TTL header
         if (val && vallen >= sizeof(int64_t)) {
@@ -524,8 +578,8 @@ static uint64_t PerformCleanup() {
             if (ttl_ms > 0 && ttl_ms < current_time_ms) {
                 // Key has expired, delete it
                 DeleteKeyFromDB(keyname, keylen);
-                keys_removed++;
-                __sync_fetch_and_add(&stats.keys_expired, 1);
+                num_keys_cleaned++;
+                __sync_fetch_and_sub(&stats.num_keys_stored, 1);
                 LOG(ctx, "debug", "spill: expired key removed: %.*s (ttl=%lld, now=%lld)",
                     (int)keylen, keyname, (long long)ttl_ms, (long long)current_time_ms);
             }
@@ -543,11 +597,13 @@ static uint64_t PerformCleanup() {
         free(err);
     }
 
-    __sync_fetch_and_add(&stats.keys_cleaned, keys_removed);
+    __sync_fetch_and_add(&stats.total_keys_cleaned, num_keys_cleaned);
+    stats.last_num_keys_cleaned = num_keys_cleaned;
+    stats.last_cleanup_at = (int64_t)time(NULL);
     LOG(ctx, "debug", "spill: cleanup completed: checked=%llu, removed=%llu",
-        (unsigned long long)keys_checked, (unsigned long long)keys_removed);
+        (unsigned long long)num_keys_scanned, (unsigned long long)num_keys_cleaned);
 
-    return keys_removed;
+    return num_keys_cleaned;
 }
 
 int CleanupCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
@@ -561,8 +617,8 @@ int CleanupCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     }
 
     // Iterate through RocksDB to find and remove expired keys
-    uint64_t keys_checked = 0;
-    uint64_t keys_removed = 0;
+    uint64_t num_keys_scanned = 0;
+    uint64_t num_keys_cleaned = 0;
     int64_t current_time_ms = (int64_t)time(NULL) * 1000;
 
     rocksdb_iterator_t *iter = rocksdb_create_iterator(db, roptions);
@@ -573,7 +629,7 @@ int CleanupCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
         const char *keyname = rocksdb_iter_key(iter, &keylen);
         const char *val = rocksdb_iter_value(iter, &vallen);
 
-        keys_checked++;
+        num_keys_scanned++;
 
         // Check if value has TTL header
         if (val && vallen >= sizeof(int64_t)) {
@@ -584,8 +640,8 @@ int CleanupCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
             if (ttl_ms > 0 && ttl_ms < current_time_ms) {
                 // Key has expired, delete it
                 DeleteKeyFromDB(keyname, keylen);
-                keys_removed++;
-                __sync_fetch_and_add(&stats.keys_expired, 1);
+                num_keys_cleaned++;
+                __sync_fetch_and_sub(&stats.num_keys_stored, 1);
                 LOG(ctx, "debug", "spill: expired key removed: %.*s (ttl=%lld, now=%lld)",
                     (int)keylen, keyname, (long long)ttl_ms, (long long)current_time_ms);
             }
@@ -605,235 +661,42 @@ int CleanupCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
         return VALKEYMODULE_OK;
     }
 
-    __sync_fetch_and_add(&stats.keys_cleaned, keys_removed);
+    __sync_fetch_and_add(&stats.total_keys_cleaned, num_keys_cleaned);
+    stats.last_num_keys_cleaned = num_keys_cleaned;
+    stats.last_cleanup_at = (int64_t)time(NULL);
     LOG(ctx, "debug", "spill: cleanup completed: checked=%llu, removed=%llu",
-        (unsigned long long)keys_checked, (unsigned long long)keys_removed);
+        (unsigned long long)num_keys_scanned, (unsigned long long)num_keys_cleaned);
 
     ValkeyModule_ReplyWithArray(ctx, 4);
-    ValkeyModule_ReplyWithSimpleString(ctx, "keys_checked");
-    ValkeyModule_ReplyWithLongLong(ctx, keys_checked);
-    ValkeyModule_ReplyWithSimpleString(ctx, "keys_removed");
-    ValkeyModule_ReplyWithLongLong(ctx, keys_removed);
+    ValkeyModule_ReplyWithSimpleString(ctx, "num_keys_scanned");
+    ValkeyModule_ReplyWithLongLong(ctx, num_keys_scanned);
+    ValkeyModule_ReplyWithSimpleString(ctx, "num_keys_cleaned");
+    ValkeyModule_ReplyWithLongLong(ctx, num_keys_cleaned);
 
     return VALKEYMODULE_OK;
 }
 
-int StatsCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
-    VALKEYMODULE_NOT_USED(argv);
-    VALKEYMODULE_NOT_USED(argc);
+void SpillInfoFunc(ValkeyModuleInfoCtx *ctx, int for_crash_report) {
+    VALKEYMODULE_NOT_USED(for_crash_report);
 
-    ValkeyModule_ReplyWithArray(ctx, 12);
+    // Add Statistics section
+    ValkeyModule_InfoAddSection(ctx, "stats");
+    ValkeyModule_InfoAddFieldULongLong(ctx, "num_keys_stored", stats.num_keys_stored);
+    ValkeyModule_InfoAddFieldULongLong(ctx, "total_keys_written", stats.total_keys_written);
+    ValkeyModule_InfoAddFieldULongLong(ctx, "total_keys_restored", stats.total_keys_restored);
+    ValkeyModule_InfoAddFieldULongLong(ctx, "total_keys_cleaned", stats.total_keys_cleaned);
+    ValkeyModule_InfoAddFieldULongLong(ctx, "last_num_keys_cleaned", stats.last_num_keys_cleaned);
+    ValkeyModule_InfoAddFieldLongLong(ctx, "last_cleanup_at", stats.last_cleanup_at);
+    ValkeyModule_InfoAddFieldULongLong(ctx, "total_bytes_written", stats.total_bytes_written);
+    ValkeyModule_InfoAddFieldULongLong(ctx, "total_bytes_read", stats.total_bytes_read);
 
-    ValkeyModule_ReplyWithSimpleString(ctx, "keys_stored");
-    ValkeyModule_ReplyWithLongLong(ctx, stats.keys_stored);
-
-    ValkeyModule_ReplyWithSimpleString(ctx, "keys_restored");
-    ValkeyModule_ReplyWithLongLong(ctx, stats.keys_restored);
-
-    ValkeyModule_ReplyWithSimpleString(ctx, "keys_expired");
-    ValkeyModule_ReplyWithLongLong(ctx, stats.keys_expired);
-
-    ValkeyModule_ReplyWithSimpleString(ctx, "keys_cleaned");
-    ValkeyModule_ReplyWithLongLong(ctx, stats.keys_cleaned);
-
-    ValkeyModule_ReplyWithSimpleString(ctx, "bytes_written");
-    ValkeyModule_ReplyWithLongLong(ctx, stats.bytes_written);
-
-    ValkeyModule_ReplyWithSimpleString(ctx, "bytes_read");
-    ValkeyModule_ReplyWithLongLong(ctx, stats.bytes_read);
-
-    return VALKEYMODULE_OK;
+    // Add Configuration section
+    ValkeyModule_InfoAddSection(ctx, "config");
+    ValkeyModule_InfoAddFieldCString(ctx, "path", config.path ? config.path : "");
+    ValkeyModule_InfoAddFieldULongLong(ctx, "max_memory_bytes", config.max_memory);
+    ValkeyModule_InfoAddFieldLongLong(ctx, "cleanup_interval_seconds", config.cleanup_interval);
 }
 
-// Helper function to get RocksDB property as integer
-static int64_t get_rocksdb_int_property(const char *property) {
-    if (!db) return -1;
-
-    char *value = rocksdb_property_value(db, property);
-    if (!value) return -1;
-
-    int64_t result = atoll(value);
-    free(value);
-    return result;
-}
-
-// Helper function to append formatted string to buffer
-static void append_info_line(char **buffer, size_t *size, size_t *capacity,
-                             const char *key, const char *value) {
-    size_t needed = strlen(key) + strlen(value) + 3; // key:value\r\n
-
-    while (*size + needed >= *capacity) {
-        *capacity *= 2;
-        *buffer = realloc(*buffer, *capacity);
-    }
-
-    *size += sprintf(*buffer + *size, "%s:%s\r\n", key, value);
-}
-
-static void append_info_line_int(char **buffer, size_t *size, size_t *capacity,
-                                 const char *key, int64_t value) {
-    char value_str[32];
-    snprintf(value_str, sizeof(value_str), "%lld", (long long)value);
-    append_info_line(buffer, size, capacity, key, value_str);
-}
-
-static void append_info_section(char **buffer, size_t *size, size_t *capacity,
-                                const char *section_name) {
-    size_t needed = strlen(section_name) + 4; // # section\r\n
-
-    while (*size + needed >= *capacity) {
-        *capacity *= 2;
-        *buffer = realloc(*buffer, *capacity);
-    }
-
-    *size += sprintf(*buffer + *size, "# %s\r\n", section_name);
-}
-
-int InfoCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
-    VALKEYMODULE_NOT_USED(argv);
-    VALKEYMODULE_NOT_USED(argc);
-
-    if (!db) {
-        return ValkeyModule_ReplyWithError(ctx, ERR_DB_NOT_INIT);
-    }
-
-    // Initialize buffer for formatted output
-    size_t capacity = 4096;
-    size_t size = 0;
-    char *buffer = malloc(capacity);
-    if (!buffer) {
-        return ValkeyModule_ReplyWithError(ctx, "ERR Out of memory");
-    }
-
-    // Spill section - our custom metrics
-    append_info_section(&buffer, &size, &capacity, "spill");
-    append_info_line_int(&buffer, &size, &capacity, "keys_stored", stats.keys_stored);
-    append_info_line_int(&buffer, &size, &capacity, "keys_restored", stats.keys_restored);
-    append_info_line_int(&buffer, &size, &capacity, "keys_expired", stats.keys_expired);
-    append_info_line_int(&buffer, &size, &capacity, "keys_cleaned", stats.keys_cleaned);
-    append_info_line_int(&buffer, &size, &capacity, "bytes_written", stats.bytes_written);
-    append_info_line_int(&buffer, &size, &capacity, "bytes_read", stats.bytes_read);
-    append_info_line(&buffer, &size, &capacity, "path", config.path);
-
-    char max_mem_str[64];
-    snprintf(max_mem_str, sizeof(max_mem_str), "%zu (%zuMB)",
-             config.max_memory, config.max_memory / (1024 * 1024));
-    append_info_line(&buffer, &size, &capacity, "max_memory", max_mem_str);
-
-    append_info_line_int(&buffer, &size, &capacity, "cleanup_interval", config.cleanup_interval);
-
-    // RocksDB Memory section
-    append_info_section(&buffer, &size, &capacity, "rocksdb_memory");
-
-    int64_t block_cache_usage = get_rocksdb_int_property("rocksdb.block-cache-usage");
-    if (block_cache_usage >= 0) {
-        char usage_str[64];
-        snprintf(usage_str, sizeof(usage_str), "%lld (%lldMB)",
-                 (long long)block_cache_usage, (long long)(block_cache_usage / (1024 * 1024)));
-        append_info_line(&buffer, &size, &capacity, "block_cache_usage", usage_str);
-    }
-
-    int64_t block_cache_pinned = get_rocksdb_int_property("rocksdb.block-cache-pinned-usage");
-    if (block_cache_pinned >= 0) {
-        char pinned_str[64];
-        snprintf(pinned_str, sizeof(pinned_str), "%lld (%lldMB)",
-                 (long long)block_cache_pinned, (long long)(block_cache_pinned / (1024 * 1024)));
-        append_info_line(&buffer, &size, &capacity, "block_cache_pinned_usage", pinned_str);
-    }
-
-    int64_t memtable_size = get_rocksdb_int_property("rocksdb.cur-size-all-mem-tables");
-    if (memtable_size >= 0) {
-        char mem_str[64];
-        snprintf(mem_str, sizeof(mem_str), "%lld (%lldMB)",
-                 (long long)memtable_size, (long long)(memtable_size / (1024 * 1024)));
-        append_info_line(&buffer, &size, &capacity, "memtable_size", mem_str);
-    }
-
-    int64_t table_readers_mem = get_rocksdb_int_property("rocksdb.estimate-table-readers-mem");
-    if (table_readers_mem >= 0) {
-        char readers_str[64];
-        snprintf(readers_str, sizeof(readers_str), "%lld (%lldMB)",
-                 (long long)table_readers_mem, (long long)(table_readers_mem / (1024 * 1024)));
-        append_info_line(&buffer, &size, &capacity, "table_readers_mem", readers_str);
-    }
-
-    // RocksDB Storage section
-    append_info_section(&buffer, &size, &capacity, "rocksdb_storage");
-
-    int64_t num_keys = get_rocksdb_int_property("rocksdb.estimate-num-keys");
-    if (num_keys >= 0) {
-        append_info_line_int(&buffer, &size, &capacity, "estimated_keys", num_keys);
-    }
-
-    int64_t live_data_size = get_rocksdb_int_property("rocksdb.estimate-live-data-size");
-    if (live_data_size >= 0) {
-        char size_str[64];
-        snprintf(size_str, sizeof(size_str), "%lld (%lldMB)",
-                 (long long)live_data_size, (long long)(live_data_size / (1024 * 1024)));
-        append_info_line(&buffer, &size, &capacity, "live_data_size", size_str);
-    }
-
-    int64_t total_sst_size = get_rocksdb_int_property("rocksdb.total-sst-files-size");
-    if (total_sst_size >= 0) {
-        char sst_str[64];
-        snprintf(sst_str, sizeof(sst_str), "%lld (%lldMB)",
-                 (long long)total_sst_size, (long long)(total_sst_size / (1024 * 1024)));
-        append_info_line(&buffer, &size, &capacity, "total_sst_files_size", sst_str);
-    }
-
-    int64_t num_snapshots = get_rocksdb_int_property("rocksdb.num-snapshots");
-    if (num_snapshots >= 0) {
-        append_info_line_int(&buffer, &size, &capacity, "num_snapshots", num_snapshots);
-    }
-
-    // RocksDB Compaction section
-    append_info_section(&buffer, &size, &capacity, "rocksdb_compaction");
-
-    int64_t num_immutable = get_rocksdb_int_property("rocksdb.num-immutable-mem-table");
-    if (num_immutable >= 0) {
-        append_info_line_int(&buffer, &size, &capacity, "num_immutable_memtables", num_immutable);
-    }
-
-    int64_t flush_pending = get_rocksdb_int_property("rocksdb.mem-table-flush-pending");
-    if (flush_pending >= 0) {
-        append_info_line(&buffer, &size, &capacity, "memtable_flush_pending",
-                        flush_pending ? "yes" : "no");
-    }
-
-    int64_t compaction_pending = get_rocksdb_int_property("rocksdb.compaction-pending");
-    if (compaction_pending >= 0) {
-        append_info_line(&buffer, &size, &capacity, "compaction_pending",
-                        compaction_pending ? "yes" : "no");
-    }
-
-    int64_t bg_errors = get_rocksdb_int_property("rocksdb.background-errors");
-    if (bg_errors >= 0) {
-        append_info_line_int(&buffer, &size, &capacity, "background_errors", bg_errors);
-    }
-
-    int64_t base_level = get_rocksdb_int_property("rocksdb.base-level");
-    if (base_level >= 0) {
-        append_info_line_int(&buffer, &size, &capacity, "base_level", base_level);
-    }
-
-    // Get level file counts (L0-L6 are common)
-    for (int level = 0; level <= 6; level++) {
-        char property[64];
-        snprintf(property, sizeof(property), "rocksdb.num-files-at-level%d", level);
-        int64_t num_files = get_rocksdb_int_property(property);
-        if (num_files >= 0) {
-            char key[32];
-            snprintf(key, sizeof(key), "num_files_L%d", level);
-            append_info_line_int(&buffer, &size, &capacity, key, num_files);
-        }
-    }
-
-    // Reply with formatted output
-    ValkeyModule_ReplyWithVerbatimString(ctx, buffer, size);
-    free(buffer);
-
-    return VALKEYMODULE_OK;
-}
 
 int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     if (ValkeyModule_Init(ctx, "spill", 1, VALKEYMODULE_APIVER_1) == VALKEYMODULE_ERR) {
@@ -855,6 +718,11 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
         return VALKEYMODULE_ERR;
     }
 
+    // Count active keys in RocksDB at startup
+    stats.num_keys_stored = CountActiveKeys();
+    ValkeyModule_Log(ctx, "notice", "spill: found %llu active keys in RocksDB",
+                     (unsigned long long)stats.num_keys_stored);
+
     if (ValkeyModule_SubscribeToKeyspaceEvents(ctx, VALKEYMODULE_NOTIFY_PREEVICTION, PreevictionKeyNotification) != VALKEYMODULE_OK) {
         return VALKEYMODULE_ERR;
     }
@@ -868,19 +736,15 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
         return VALKEYMODULE_ERR;
     }
 
-    if (ValkeyModule_CreateCommand(ctx, "spill.info", InfoCommand, "readonly", 0, 0, 0) == VALKEYMODULE_ERR) {
-        CleanupRocksDB();
-        return VALKEYMODULE_ERR;
-    }
-
     if (ValkeyModule_CreateCommand(ctx, "spill.cleanup", CleanupCommand, "write", 0, 0, 0) == VALKEYMODULE_ERR) {
         CleanupRocksDB();
         return VALKEYMODULE_ERR;
     }
 
-    if (ValkeyModule_CreateCommand(ctx, "spill.stats", StatsCommand, "readonly", 0, 0, 0) == VALKEYMODULE_ERR) {
-        CleanupRocksDB();
-        return VALKEYMODULE_ERR;
+    // Register info callback so Spill stats appear in INFO/INFO ALL output
+    if (ValkeyModule_RegisterInfoFunc(ctx, SpillInfoFunc) == VALKEYMODULE_ERR) {
+        ValkeyModule_Log(ctx, "warning", "spill: failed to register info callback");
+        // Not a fatal error, continue without INFO integration
     }
 
     // Start the cleanup thread if cleanup_interval > 0
@@ -905,10 +769,10 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
 }
 
 int ValkeyModule_OnUnload(ValkeyModuleCtx *ctx) {
-    ValkeyModule_Log(ctx, "notice", "spill: unloading module, stats: stored=%llu restored=%llu expired=%llu",
-                     (unsigned long long)stats.keys_stored,
-                     (unsigned long long)stats.keys_restored,
-                     (unsigned long long)stats.keys_expired);
+    ValkeyModule_Log(ctx, "notice", "spill: unloading module, stats: stored=%llu restored=%llu cleaned=%llu",
+                     (unsigned long long)stats.num_keys_stored,
+                     (unsigned long long)stats.total_keys_restored,
+                     (unsigned long long)stats.total_keys_cleaned);
 
     // Stop the cleanup thread if it's running
     if (cleanup_thread_running) {

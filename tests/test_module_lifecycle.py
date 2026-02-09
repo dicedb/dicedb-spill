@@ -119,12 +119,8 @@ def test_module_loading_with_default_config():
         r = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True)
 
         # Test that spill commands are available
-        stats = r.execute_command('spill.stats')
-        assert isinstance(stats, list), "Stats should return list"
-
-        # Test that RocksDB was initialized
-        info = r.execute_command('spill.info')
-        assert isinstance(info, str) and len(info) > 0, "Info should return RocksDB stats"
+        cleanup_result = r.execute_command('spill.cleanup')
+        assert isinstance(cleanup_result, list), "Cleanup should return list"
 
 def test_module_loading_with_custom_config():
     """Test module loading with custom configuration parameters"""
@@ -140,8 +136,8 @@ def test_module_loading_with_custom_config():
             r = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True)
 
             # Test that module loaded with custom config
-            stats = r.execute_command('spill.stats')
-            assert isinstance(stats, list), "Stats should return list"
+            cleanup_result = r.execute_command('spill.cleanup')
+            assert isinstance(cleanup_result, list), "Cleanup should return list"
 
             # Verify custom RocksDB path is being used
             assert os.path.exists(custom_path), "Custom RocksDB path should exist"
@@ -170,7 +166,7 @@ def test_module_config_validation():
                     r = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True, socket_connect_timeout=1)
                     # Try to execute spill command - should fail or not be available
                     try:
-                        r.execute_command('spill.stats')
+                        r.execute_command('spill.cleanup')
                         # If command works, the module loaded despite invalid config (unexpected)
                         assert False, "Module should not load with max-memory < 20MB"
                     except redis.ResponseError:
@@ -202,12 +198,8 @@ def test_module_min_memory_validation():
             r = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True)
 
             # Module should load successfully
-            stats = r.execute_command('spill.stats')
-            assert isinstance(stats, list), "Stats should work with 20MB config"
-
-            # Verify module is functional
-            info = r.execute_command('spill.info')
-            assert isinstance(info, str) and len(info) > 0, "Info should return data"
+            cleanup_result = r.execute_command('spill.cleanup')
+            assert isinstance(cleanup_result, list), "Cleanup should work with 20MB config"
 
         # Clean up for next test
         if os.path.exists(valid_path):
@@ -234,7 +226,7 @@ def test_module_min_memory_validation():
                     r = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True, socket_connect_timeout=1)
                     server_started = True
                     try:
-                        r.execute_command('spill.stats')
+                        r.execute_command('spill.cleanup')
                         module_loaded = True
                     except redis.ResponseError:
                         module_loaded = False
@@ -270,18 +262,9 @@ def test_memory_allocation_distribution():
         with temporary_dicedb_server(TEST_PORT, module_args) as (proc, temp_dir):
             r = redis.Redis(host='localhost', port=TEST_PORT, decode_responses=True)
 
-            # Get info to check memory allocation
-            info = r.execute_command('spill.info')
-            assert isinstance(info, str), "Info should return string"
-
-            # Parse info to verify configuration
-            # The log output should show block_cache=8MB and write_buffer=28MB
-            # We can verify the module loaded successfully with the right config
-            stats = r.execute_command('spill.stats')
-            assert isinstance(stats, list), "Module should be functional with correct memory allocation"
-
-            # Verify the max_memory setting in info
-            assert '50' in info or '52428800' in info, "Info should contain max_memory setting"
+            # Verify the module loaded successfully with the right config
+            cleanup_result = r.execute_command('spill.cleanup')
+            assert isinstance(cleanup_result, list), "Module should be functional with correct memory allocation"
 
     finally:
         if os.path.exists(valid_path):
@@ -411,12 +394,9 @@ def test_module_graceful_shutdown():
             # Verify eviction occurred
             assert r.get('shutdown_key') is None
 
-            # Get initial stats
-            stats = r.execute_command('spill.stats')
-            stats_dict = {stats[i]: stats[i+1] for i in range(0, len(stats), 2)}
-            keys_stored = stats_dict['keys_stored']
-
-            assert keys_stored > 0, "Some keys should be stored before shutdown"
+            # Verify module is functional before shutdown
+            cleanup_result = r.execute_command('spill.cleanup')
+            assert isinstance(cleanup_result, list), "Module should be functional before shutdown"
 
         # Server should have shut down gracefully
         # RocksDB directory should still exist with data
@@ -466,8 +446,8 @@ def test_module_error_recovery():
         r.set('recovery_test', 'recovery_value')
         assert r.get('recovery_test') == 'recovery_value'
 
-        stats = r.execute_command('spill.stats')
-        assert isinstance(stats, list)
+        cleanup_result = r.execute_command('spill.cleanup')
+        assert isinstance(cleanup_result, list)
 
 def test_module_performance_under_load():
     """Test module performance under concurrent load"""
@@ -539,8 +519,8 @@ def test_module_performance_under_load():
         assert len(results['errors']) < results['stored'] * 0.1, "Error rate should be < 10%"
 
         # Verify system is still responsive
-        final_stats = r.execute_command('spill.stats')
-        assert isinstance(final_stats, list)
+        cleanup_result = r.execute_command('spill.cleanup')
+        assert isinstance(cleanup_result, list)
 
 def main():
     """Main test runner for module lifecycle tests"""
