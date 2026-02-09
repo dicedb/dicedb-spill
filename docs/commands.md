@@ -1,8 +1,33 @@
 # Spill Module Commands
 
-Spill module automatically persists evicted keys to RocksDB storage, providing
-disk bound cache capacity with transparent key restoration and full TTL preservation.
-The module provides four commands
+Spill module transparently persists evicted keys to disk (RocksDB), providing
+disk-bound cache capacity with transparent key restoration and full TTL preservation.
+
+## Overview
+
+When keys are evicted (either automatically due to memory pressure with an eviction policy,
+or manually using the `EVICT` command), they are transparently moved to RocksDB. These keys
+remain logically accessible - any read operation automatically restores them back to memory.
+
+### Automatic Cleanup
+
+The module runs a background thread that periodically scans RocksDB to remove expired keys.
+This cleanup interval can be configured using the `cleanup-interval` parameter (default: 300 seconds).
+The automatic cleanup runs asynchronously and does not block the main DiceDB thread.
+
+### Configuration
+
+The Spill module accepts the following configuration parameters at load time:
+
+- `max-memory` - Memory budget for RocksDB in bytes (e.g., `268435456` for 256MB)
+- `cleanup-interval` - Seconds between automatic cleanup runs (default: 300)
+
+Example module load:
+```
+loadmodule /path/to/spill.so max-memory 268435456 cleanup-interval 600
+```
+
+The module provides four commands for management and monitoring
 
 ## SPILL.RESTORE
 
@@ -12,8 +37,9 @@ SPILL.RESTORE key
 
 Manually restore an evicted key from RocksDB storage.
 
-Normally, keys are restored automatically when accessed after eviction.
-This command allows explicit restoration without requiring a key access.
+After eviction, keys are automatically restored when accessed through commands like
+GET, EXISTS, TYPE, LRANGE, SMEMBERS, HGETALL, etc. This command allows explicit
+restoration without triggering an access command.
 
 Return value:
 
@@ -26,18 +52,50 @@ Return value:
 Examples:
 
 ```
+> SET mykey "myvalue"
+OK
+
+> EVICT mykey
+mykey
+
+> KEYS *
+(empty array)
+
 > SPILL.RESTORE mykey
 OK
 
+> GET mykey
+"myvalue"
+
 > SPILL.RESTORE nonexistent
 (nil)
+
+> SET existing "in_memory"
+OK
+
+> SET evicted "in_rocksdb"
+OK
+
+> EVICT evicted
+evicted
+
+> SET evicted "new_memory_value"
+OK
+
+> SPILL.RESTORE evicted
+(nil)
+
+> GET evicted
+"new_memory_value"
 ```
 
 **Notes:**
 
 - Restored keys are removed from RocksDB after successful restoration
 - TTL is preserved during restoration
-- If a key with the same name exists in memory, it will be replaced
+- If a key with the same name already exists in memory, restoration is skipped and returns `(nil)`
+- After eviction, keys logically still exist and accessing them automatically triggers restoration
+- Works with all Redis data types: strings, lists, sets, hashes, sorted sets, etc.
 
 ## SPILL.INFO
 
@@ -60,6 +118,7 @@ Module-specific metrics and configuration.
 - `bytes_read` - Total bytes read from RocksDB (includes metadata)
 - `path` - RocksDB database directory path
 - `max_memory` - Configured memory budget for RocksDB in bytes and MB
+- `cleanup_interval` - Automatic cleanup interval in seconds (configurable)
 
 ### rocksdb_memory
 
@@ -103,6 +162,7 @@ bytes_written:45678901
 bytes_read:23456789
 path:/tmp/dicedb-l2
 max_memory:268435456 (256MB)
+cleanup_interval:300
 
 # rocksdb_memory
 block_cache_usage:4194304 (4MB)
@@ -129,9 +189,12 @@ num_files_L2:5
 
 **Notes:**
 
-- All memory values show bytes and MB
-- Estimated values are approximate
+- All memory values show bytes and MB (e.g., `262144000 (250MB)`)
+- Estimated values (like `estimated_keys`) are approximate
 - Use this command to monitor RocksDB health and memory usage
+- The `num_files_L0` through `num_files_L6` show the distribution of SST files across LSM tree levels
+- The `cleanup_interval` parameter can be configured at module load time (default: 300 seconds)
+- The `keys_cleaned` counter includes both automatic periodic cleanups and manual SPILL.CLEANUP invocations
 
 ## SPILL.CLEANUP
 
@@ -139,11 +202,17 @@ num_files_L2:5
 SPILL.CLEANUP
 ```
 
-Cleanup command scans entire RocksDB and remove all expired keys.
+Manually scans the entire RocksDB database and removes all expired keys.
 
-This is a manual cleanup operation. The module automatically cleans expired
-keys during restore attempts, but this command performs a full scan to cleanup
-and delete the expired keys.
+**⚠️ Warning**: This is a blocking operation that runs on the main DiceDB thread and may
+stall other commands while executing. Use with caution in production environments.
+
+This is a manual cleanup operation that performs a full database scan. The module automatically:
+1. Cleans expired keys during restore attempts (returning `ERR Key has expired`)
+2. Runs periodic background cleanup every `cleanup-interval` seconds (default: 300)
+
+Use this command only when you need to immediately reclaim disk space from expired keys
+or when the automatic cleanup interval is not sufficient.
 
 Return value:
 
@@ -155,19 +224,38 @@ Array with cleanup statistics:
 Example:
 
 ```
+> SET temp1 "value" EX 1
+OK
+
+> SET temp2 "value" EX 1
+OK
+
+> EVICT temp1 temp2
+temp1
+temp2
+
+(wait for keys to expire...)
+
 > SPILL.CLEANUP
 1) "keys_checked"
 2) (integer) 1523
 3) "keys_removed"
 4) (integer) 47
+
+> SPILL.INFO
+...
+keys_expired:47
+...
 ```
 
 **Notes:**
 
-- This operation scans the entire RocksDB database
-- Performance depends on number of keys in RocksDB
-- Removed keys increment the `keys_expired` counter in SPILL.INFO
-- Use periodically to reclaim disk space from expired keys
+- **This is a blocking operation** - it runs on the main thread and may impact performance
+- Scans the entire RocksDB database sequentially
+- Performance depends on the number of keys in RocksDB
+- Removed keys increment both the `keys_expired` and `keys_cleaned` counters in SPILL.INFO
+- In most cases, rely on the automatic periodic cleanup instead of using this command
+- Returns an array (displayed as alternating key-value pairs in CLI)
 
 ## SPILL.STATS
 
@@ -177,7 +265,8 @@ SPILL.STATS
 
 Returns basic statistics about Spill module operations.
 
-This command is a simpler alternative to SPILL.INFO, returning only core metrics as an array.
+This command is a simpler alternative to SPILL.INFO, returning only core operational
+metrics as an array without RocksDB internals.
 
 Return value:
 
@@ -211,5 +300,7 @@ Example:
 **Notes:**
 
 - All counters are cumulative since module load
-- Counters reset when module is reloaded
-- Use SPILL.INFO for comprehensive metrics including RocksDB internals
+- Counters reset when the module is reloaded or server is restarted
+- Returns an array (displayed as alternating key-value pairs in CLI)
+- Use SPILL.INFO for comprehensive metrics including RocksDB memory and storage internals
+- The `bytes_written` and `bytes_read` include metadata overhead, not just key-value data

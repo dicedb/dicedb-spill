@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <stdint.h>
+#include <pthread.h>
 
 #define likely(x)   __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
@@ -44,12 +45,21 @@ static const char *ERR_CORRUPTED_DATA = "ERR Corrupted data in RocksDB";
 typedef struct {
     char *path;
     size_t max_memory;  // Maximum memory budget for RocksDB (block cache + write buffers)
+    int cleanup_interval;  // Periodic cleanup interval in seconds
 } SpillConfig;
 
 static SpillConfig config = {
     .path = NULL,
-    .max_memory = 256 * 1024 * 1024  // Default: 256MB total memory budget
+    .max_memory = 256 * 1024 * 1024,  // Default: 256MB total memory budget
+    .cleanup_interval = 300  // Default: 5 minutes (300 seconds)
 };
+
+// Cleanup thread management
+static pthread_t cleanup_thread;
+static volatile int cleanup_thread_running = 0;
+
+// Forward declarations
+static uint64_t PerformCleanup();
 
 static void DeleteKeyFromDB(const char *keyname, size_t keylen) {
     if (!db) return;
@@ -164,6 +174,12 @@ int ParseModuleArgs(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
             config.max_memory = (size_t)atoll(value);
             if (config.max_memory < MIN_MAX_MEMORY_MB * 1024 * 1024) {
                 ValkeyModule_Log(ctx, "warning", "spill: max-memory must be at least %dMB, got %zu bytes", MIN_MAX_MEMORY_MB, config.max_memory);
+                return VALKEYMODULE_ERR;
+            }
+        } else if (strcasecmp(key, "cleanup-interval") == 0 || strcasecmp(key, "cleanup_interval") == 0) {
+            config.cleanup_interval = atoi(value);
+            if (config.cleanup_interval < 0) {
+                ValkeyModule_Log(ctx, "warning", "spill: cleanup-interval must be non-negative, got %d", config.cleanup_interval);
                 return VALKEYMODULE_ERR;
             }
         }
@@ -452,6 +468,88 @@ int RestoreCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     }
 }
 
+// Background thread function for periodic cleanup
+static void *CleanupThreadFunc(void *arg) {
+    VALKEYMODULE_NOT_USED(arg);
+
+    ValkeyModule_Log(module_ctx, "notice", "spill: cleanup thread started with interval=%d seconds",
+                     config.cleanup_interval);
+
+    while (cleanup_thread_running) {
+        // Sleep for the configured interval (in smaller chunks to allow for clean shutdown)
+        for (int i = 0; i < config.cleanup_interval && cleanup_thread_running; i++) {
+            sleep(1);
+        }
+
+        if (!cleanup_thread_running) break;
+
+        // Skip cleanup if interval is 0 (disabled)
+        if (config.cleanup_interval <= 0) continue;
+
+        ValkeyModule_Log(module_ctx, "debug", "spill: starting periodic cleanup");
+        uint64_t removed = PerformCleanup();
+        ValkeyModule_Log(module_ctx, "debug", "spill: periodic cleanup removed %llu keys",
+                        (unsigned long long)removed);
+    }
+
+    ValkeyModule_Log(module_ctx, "notice", "spill: cleanup thread stopped");
+    return NULL;
+}
+
+// Performs cleanup of expired keys from RocksDB
+// Returns number of keys removed
+static uint64_t PerformCleanup() {
+    if (!db) return 0;
+
+    uint64_t keys_checked = 0;
+    uint64_t keys_removed = 0;
+    int64_t current_time_ms = (int64_t)time(NULL) * 1000;
+
+    rocksdb_iterator_t *iter = rocksdb_create_iterator(db, roptions);
+    rocksdb_iter_seek_to_first(iter);
+
+    while (rocksdb_iter_valid(iter) && cleanup_thread_running) {
+        size_t keylen, vallen;
+        const char *keyname = rocksdb_iter_key(iter, &keylen);
+        const char *val = rocksdb_iter_value(iter, &vallen);
+
+        keys_checked++;
+
+        // Check if value has TTL header
+        if (val && vallen >= sizeof(int64_t)) {
+            int64_t ttl_ms;
+            memcpy(&ttl_ms, val, sizeof(int64_t));
+
+            // If TTL is set (positive) and has expired
+            if (ttl_ms > 0 && ttl_ms < current_time_ms) {
+                // Key has expired, delete it
+                DeleteKeyFromDB(keyname, keylen);
+                keys_removed++;
+                __sync_fetch_and_add(&stats.keys_expired, 1);
+                LOG(ctx, "debug", "spill: expired key removed: %.*s (ttl=%lld, now=%lld)",
+                    (int)keylen, keyname, (long long)ttl_ms, (long long)current_time_ms);
+            }
+        }
+
+        rocksdb_iter_next(iter);
+    }
+
+    char *err = NULL;
+    rocksdb_iter_get_error(iter, &err);
+    rocksdb_iter_destroy(iter);
+
+    if (err != NULL) {
+        LOG(ctx, "warning", "spill: cleanup iteration error: %s", err);
+        free(err);
+    }
+
+    __sync_fetch_and_add(&stats.keys_cleaned, keys_removed);
+    LOG(ctx, "debug", "spill: cleanup completed: checked=%llu, removed=%llu",
+        (unsigned long long)keys_checked, (unsigned long long)keys_removed);
+
+    return keys_removed;
+}
+
 int CleanupCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     VALKEYMODULE_NOT_USED(argv);
     VALKEYMODULE_NOT_USED(argc);
@@ -622,6 +720,8 @@ int InfoCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
              config.max_memory, config.max_memory / (1024 * 1024));
     append_info_line(&buffer, &size, &capacity, "max_memory", max_mem_str);
 
+    append_info_line_int(&buffer, &size, &capacity, "cleanup_interval", config.cleanup_interval);
+
     // RocksDB Memory section
     append_info_section(&buffer, &size, &capacity, "rocksdb_memory");
 
@@ -783,8 +883,23 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
         return VALKEYMODULE_ERR;
     }
 
-    ValkeyModule_Log(ctx, "notice", "spill: module loaded successfully, path=%s, max_memory=%zuMB",
-                     config.path, config.max_memory / (1024 * 1024));
+    // Start the cleanup thread if cleanup_interval > 0
+    if (config.cleanup_interval > 0) {
+        cleanup_thread_running = 1;
+        if (pthread_create(&cleanup_thread, NULL, CleanupThreadFunc, NULL) != 0) {
+            ValkeyModule_Log(ctx, "warning", "spill: failed to create cleanup thread");
+            cleanup_thread_running = 0;
+            // Not a fatal error, continue without periodic cleanup
+        } else {
+            ValkeyModule_Log(ctx, "notice", "spill: cleanup thread started with interval=%d seconds",
+                           config.cleanup_interval);
+        }
+    } else {
+        ValkeyModule_Log(ctx, "notice", "spill: periodic cleanup disabled (cleanup_interval=0)");
+    }
+
+    ValkeyModule_Log(ctx, "notice", "spill: module loaded successfully, path=%s, max_memory=%zuMB, cleanup_interval=%ds",
+                     config.path, config.max_memory / (1024 * 1024), config.cleanup_interval);
 
     return VALKEYMODULE_OK;
 }
@@ -794,6 +909,14 @@ int ValkeyModule_OnUnload(ValkeyModuleCtx *ctx) {
                      (unsigned long long)stats.keys_stored,
                      (unsigned long long)stats.keys_restored,
                      (unsigned long long)stats.keys_expired);
+
+    // Stop the cleanup thread if it's running
+    if (cleanup_thread_running) {
+        ValkeyModule_Log(ctx, "notice", "spill: stopping cleanup thread");
+        cleanup_thread_running = 0;
+        pthread_join(cleanup_thread, NULL);
+        ValkeyModule_Log(ctx, "notice", "spill: cleanup thread stopped");
+    }
 
     if (module_ctx) {
         ValkeyModule_FreeThreadSafeContext(module_ctx);

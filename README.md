@@ -53,14 +53,16 @@ $ make ENABLE_COMPRESSION=1
 ```bash
 $ dicedb-server -p 6379 \
     --loadmodule ./modules/dicedb-spill/lib-spill.so \
-    path /tmp/dicedb-tier2 \
-    max-memory 268435456
+    path /tmp/data/spill \
+    max-memory 268435456 \
+    cleanup-interval 300
 ```
 
 Note: The module automatically uses Snappy compression. For optimal disk usage, RocksDB should be built with compression enabled (`ENABLE_COMPRESSION=1`).
 
 ## Documentation
 
+- [Configuration Reference](docs/configuration.md)
 - [Commands Reference](docs/commands.md)
 
 ## Tests
@@ -70,7 +72,7 @@ Start the DiceDB server with the Spill module loaded:
 ```bash
 ./src/dicedb-server \
     --loadmodule ./modules/dicedb-spill/lib-spill.so \
-    path /tmp/dicedb-tier2 max-memory 256
+    path /tmp/data/spill max-memory 256 cleanup-interval 300
 ```
 
 Run the test suite:

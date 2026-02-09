@@ -14,6 +14,7 @@ UNIT_TEST_BINARY="test_unit"
 INTEGRATION_TEST_SCRIPT="test_integration.py"
 EDGE_CASE_TEST_SCRIPT="test_edge_cases.py"
 ADVANCED_SCENARIOS_SCRIPT="test_advanced_scenarios.py"
+COMMANDS_CLEANUP_TEST_SCRIPT="test_commands_and_cleanup.py"
 MODULE_BINARY="../lib-spill.so"
 
 echo "DiceDB Spill Test Suite"
@@ -134,6 +135,17 @@ run_advanced_tests() {
     fi
 }
 
+run_commands_cleanup_tests() {
+    print_status "INFO" "Commands and cleanup thread tests"
+    if python3 "$COMMANDS_CLEANUP_TEST_SCRIPT"; then
+        print_status "SUCCESS" "Commands and cleanup tests"
+        return 0
+    else
+        print_status "ERROR" "Commands and cleanup tests failed"
+        return 1
+    fi
+}
+
 run_performance_tests() {
     print_status "INFO" "Performance tests"
     python3 << 'EOF'
@@ -180,6 +192,7 @@ RUN_INTEGRATION=1
 RUN_EDGE_CASES=1
 RUN_LIFECYCLE=1
 RUN_ADVANCED=1
+RUN_COMMANDS_CLEANUP=1
 RUN_PERFORMANCE=0
 
 while [[ $# -gt 0 ]]; do
@@ -189,6 +202,7 @@ while [[ $# -gt 0 ]]; do
             RUN_EDGE_CASES=0
             RUN_LIFECYCLE=0
             RUN_ADVANCED=0
+            RUN_COMMANDS_CLEANUP=0
             RUN_PERFORMANCE=0
             shift
             ;;
@@ -197,6 +211,7 @@ while [[ $# -gt 0 ]]; do
             RUN_EDGE_CASES=0
             RUN_LIFECYCLE=0
             RUN_ADVANCED=0
+            RUN_COMMANDS_CLEANUP=0
             RUN_PERFORMANCE=0
             shift
             ;;
@@ -205,6 +220,7 @@ while [[ $# -gt 0 ]]; do
             RUN_INTEGRATION=0
             RUN_LIFECYCLE=0
             RUN_ADVANCED=0
+            RUN_COMMANDS_CLEANUP=0
             RUN_PERFORMANCE=0
             shift
             ;;
@@ -213,6 +229,7 @@ while [[ $# -gt 0 ]]; do
             RUN_INTEGRATION=0
             RUN_EDGE_CASES=0
             RUN_ADVANCED=0
+            RUN_COMMANDS_CLEANUP=0
             RUN_PERFORMANCE=0
             shift
             ;;
@@ -221,6 +238,16 @@ while [[ $# -gt 0 ]]; do
             RUN_INTEGRATION=0
             RUN_EDGE_CASES=0
             RUN_LIFECYCLE=0
+            RUN_COMMANDS_CLEANUP=0
+            RUN_PERFORMANCE=0
+            shift
+            ;;
+        --commands-only)
+            RUN_UNIT=0
+            RUN_INTEGRATION=0
+            RUN_EDGE_CASES=0
+            RUN_LIFECYCLE=0
+            RUN_ADVANCED=0
             RUN_PERFORMANCE=0
             shift
             ;;
@@ -234,6 +261,7 @@ while [[ $# -gt 0 ]]; do
             RUN_EDGE_CASES=1
             RUN_LIFECYCLE=1
             RUN_ADVANCED=1
+            RUN_COMMANDS_CLEANUP=1
             RUN_PERFORMANCE=1
             shift
             ;;
@@ -246,11 +274,12 @@ while [[ $# -gt 0 ]]; do
             echo "  --edge-cases-only    Run only edge case tests"
             echo "  --lifecycle-only     Run only module lifecycle tests"
             echo "  --advanced-only      Run only advanced scenario tests"
+            echo "  --commands-only      Run only commands and cleanup tests"
             echo "  --with-performance   Include performance tests"
             echo "  --all                Run all tests including performance"
             echo "  --help, -h           Show this help message"
             echo ""
-            echo "By default, unit, integration, edge case, lifecycle, and advanced tests are run."
+            echo "By default, all tests except performance tests are run."
             echo "Performance tests are optional due to their longer runtime."
             exit 0
             ;;
@@ -273,6 +302,7 @@ main() {
     [ $RUN_UNIT -eq 1 ] && { tests_run=$((tests_run + 1)); run_unit_tests && tests_passed=$((tests_passed + 1)) || exit_code=1; }
     [ $RUN_INTEGRATION -eq 1 ] && { tests_run=$((tests_run + 1)); run_integration_tests && tests_passed=$((tests_passed + 1)) || exit_code=1; }
     [ $RUN_EDGE_CASES -eq 1 ] && { tests_run=$((tests_run + 1)); run_edge_case_tests && tests_passed=$((tests_passed + 1)) || exit_code=1; }
+    [ $RUN_COMMANDS_CLEANUP -eq 1 ] && { tests_run=$((tests_run + 1)); run_commands_cleanup_tests && tests_passed=$((tests_passed + 1)) || exit_code=1; }
     [ $RUN_LIFECYCLE -eq 1 ] && { tests_run=$((tests_run + 1)); run_lifecycle_tests && tests_passed=$((tests_passed + 1)) || exit_code=1; }
     [ $RUN_ADVANCED -eq 1 ] && { tests_run=$((tests_run + 1)); run_advanced_tests && tests_passed=$((tests_passed + 1)) || exit_code=1; }
     [ $RUN_PERFORMANCE -eq 1 ] && { tests_run=$((tests_run + 1)); run_performance_tests && tests_passed=$((tests_passed + 1)) || exit_code=1; }
