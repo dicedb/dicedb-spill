@@ -175,20 +175,20 @@ int ParseModuleArgs(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
         } else if (strcasecmp(key, "max-memory") == 0 || strcasecmp(key, "max_memory") == 0) {
             config.max_memory = (size_t)atoll(value);
             if (config.max_memory < MIN_MAX_MEMORY_MB * 1024 * 1024) {
-                ValkeyModule_Log(ctx, "warning", "spill: max-memory must be at least %dMB, got %zu bytes", MIN_MAX_MEMORY_MB, config.max_memory);
+                ValkeyModule_Log(ctx, "warning", "max-memory must be at least %dMB, got %zu bytes", MIN_MAX_MEMORY_MB, config.max_memory);
                 return VALKEYMODULE_ERR;
             }
         } else if (strcasecmp(key, "cleanup-interval") == 0 || strcasecmp(key, "cleanup_interval") == 0) {
             config.cleanup_interval = atoi(value);
             if (config.cleanup_interval < 0) {
-                ValkeyModule_Log(ctx, "warning", "spill: cleanup-interval must be non-negative, got %d", config.cleanup_interval);
+                ValkeyModule_Log(ctx, "warning", "cleanup-interval must be non-negative, got %d", config.cleanup_interval);
                 return VALKEYMODULE_ERR;
             }
         }
     }
 
     if (!config.path) {
-        ValkeyModule_Log(ctx, "warning", "spill: 'path' parameter is required");
+        ValkeyModule_Log(ctx, "warning", "'path' parameter is required");
         return VALKEYMODULE_ERR;
     }
 
@@ -276,11 +276,11 @@ int InitRocksDB(ValkeyModuleCtx *ctx) {
 
     db = rocksdb_open(options, config.path, &err);
     if (err != NULL) {
-        ValkeyModule_Log(ctx, "warning", "spill: failed to open RocksDB: %s", err);
+        ValkeyModule_Log(ctx, "warning", "failed to open RocksDB: %s", err);
         free(err);
         return VALKEYMODULE_ERR;
     }
-    ValkeyModule_Log(ctx, "notice", "spill: RocksDB opened successfully (block_cache=%zuMB, write_buffer=%zuMB)",
+    ValkeyModule_Log(ctx, "notice", "RocksDB opened successfully (block_cache=%zuMB, write_buffer=%zuMB)",
                      block_cache_size / (1024 * 1024), write_buffer_size / (1024 * 1024));
 
     roptions = rocksdb_readoptions_create();
@@ -486,7 +486,7 @@ int RestoreCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
 static void *CleanupThreadFunc(void *arg) {
     VALKEYMODULE_NOT_USED(arg);
 
-    ValkeyModule_Log(module_ctx, "notice", "spill: cleanup thread started with interval=%d seconds",
+    ValkeyModule_Log(module_ctx, "notice", "cleanup thread started with interval=%d seconds",
                      config.cleanup_interval);
 
     while (cleanup_thread_running) {
@@ -500,13 +500,13 @@ static void *CleanupThreadFunc(void *arg) {
         // Skip cleanup if interval is 0 (disabled)
         if (config.cleanup_interval <= 0) continue;
 
-        ValkeyModule_Log(module_ctx, "debug", "spill: starting periodic cleanup");
+        ValkeyModule_Log(module_ctx, "debug", "starting periodic cleanup");
         uint64_t removed = PerformCleanup();
-        ValkeyModule_Log(module_ctx, "debug", "spill: periodic cleanup removed %llu keys",
+        ValkeyModule_Log(module_ctx, "debug", "periodic cleanup removed %llu keys",
                         (unsigned long long)removed);
     }
 
-    ValkeyModule_Log(module_ctx, "notice", "spill: cleanup thread stopped");
+    ValkeyModule_Log(module_ctx, "notice", "cleanup thread stopped");
     return NULL;
 }
 
@@ -705,22 +705,22 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
 
     module_ctx = ValkeyModule_GetDetachedThreadSafeContext(ctx);
 
-    LOG(ctx, "notice", "spill: loading module with %d arguments", argc);
+    LOG(ctx, "notice", "loading module with %d arguments", argc);
 
     if (ParseModuleArgs(ctx, argv, argc) != VALKEYMODULE_OK) {
-        ValkeyModule_Log(ctx, "warning", "spill: failed to parse module arguments");
+        ValkeyModule_Log(ctx, "warning", "failed to parse module arguments");
         return VALKEYMODULE_ERR;
     }
 
     if (InitRocksDB(ctx) != VALKEYMODULE_OK) {
-        ValkeyModule_Log(ctx, "warning", "spill: failed to initialize RocksDB");
+        ValkeyModule_Log(ctx, "warning", "failed to initialize RocksDB");
         CleanupRocksDB();
         return VALKEYMODULE_ERR;
     }
 
     // Count active keys in RocksDB at startup
     stats.num_keys_stored = CountActiveKeys();
-    ValkeyModule_Log(ctx, "notice", "spill: found %llu active keys in RocksDB",
+    ValkeyModule_Log(ctx, "notice", "found %llu active keys in RocksDB",
                      (unsigned long long)stats.num_keys_stored);
 
     if (ValkeyModule_SubscribeToKeyspaceEvents(ctx, VALKEYMODULE_NOTIFY_PREEVICTION, PreevictionKeyNotification) != VALKEYMODULE_OK) {
@@ -743,7 +743,7 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
 
     // Register info callback so Spill stats appear in INFO/INFO ALL output
     if (ValkeyModule_RegisterInfoFunc(ctx, SpillInfoFunc) == VALKEYMODULE_ERR) {
-        ValkeyModule_Log(ctx, "warning", "spill: failed to register info callback");
+        ValkeyModule_Log(ctx, "warning", "failed to register info callback");
         // Not a fatal error, continue without INFO integration
     }
 
@@ -751,35 +751,35 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
     if (config.cleanup_interval > 0) {
         cleanup_thread_running = 1;
         if (pthread_create(&cleanup_thread, NULL, CleanupThreadFunc, NULL) != 0) {
-            ValkeyModule_Log(ctx, "warning", "spill: failed to create cleanup thread");
+            ValkeyModule_Log(ctx, "warning", "failed to create cleanup thread");
             cleanup_thread_running = 0;
             // Not a fatal error, continue without periodic cleanup
         } else {
-            ValkeyModule_Log(ctx, "notice", "spill: cleanup thread started with interval=%d seconds",
+            ValkeyModule_Log(ctx, "notice", "cleanup thread started with interval=%d seconds",
                            config.cleanup_interval);
         }
     } else {
-        ValkeyModule_Log(ctx, "notice", "spill: periodic cleanup disabled (cleanup_interval=0)");
+        ValkeyModule_Log(ctx, "notice", "periodic cleanup disabled (cleanup_interval=0)");
     }
 
-    ValkeyModule_Log(ctx, "notice", "spill: module loaded successfully, path=%s, max_memory=%zuMB, cleanup_interval=%ds",
+    ValkeyModule_Log(ctx, "notice", "module loaded successfully, path=%s, max_memory=%zuMB, cleanup_interval=%ds",
                      config.path, config.max_memory / (1024 * 1024), config.cleanup_interval);
 
     return VALKEYMODULE_OK;
 }
 
 int ValkeyModule_OnUnload(ValkeyModuleCtx *ctx) {
-    ValkeyModule_Log(ctx, "notice", "spill: unloading module, stats: stored=%llu restored=%llu cleaned=%llu",
+    ValkeyModule_Log(ctx, "notice", "unloading module, stats: stored=%llu restored=%llu cleaned=%llu",
                      (unsigned long long)stats.num_keys_stored,
                      (unsigned long long)stats.total_keys_restored,
                      (unsigned long long)stats.total_keys_cleaned);
 
     // Stop the cleanup thread if it's running
     if (cleanup_thread_running) {
-        ValkeyModule_Log(ctx, "notice", "spill: stopping cleanup thread");
+        ValkeyModule_Log(ctx, "notice", "stopping cleanup thread");
         cleanup_thread_running = 0;
         pthread_join(cleanup_thread, NULL);
-        ValkeyModule_Log(ctx, "notice", "spill: cleanup thread stopped");
+        ValkeyModule_Log(ctx, "notice", "cleanup thread stopped");
     }
 
     if (module_ctx) {

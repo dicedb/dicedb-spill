@@ -17,8 +17,9 @@ The quickest and easiest way to see dicedb-spill in action is by using the offic
 
 ```bash
 docker run \
-  --name dicedb-1 -p 6379:6379 -v $(pwd)/data:/data/ \
-  dicedb:latest
+    --name dicedb-001 \
+    -p 6379:6379 -v $(pwd)/data:/data/ \
+    dicedb/dicedb
 ```
 
 This command starts a DiceDB container with the `spill` module already enabled. By default, the spill module uses RocksDB and is configured with a maximum memory limit of 250MB.
@@ -27,11 +28,14 @@ This command starts a DiceDB container with the `spill` module already enabled. 
 
 ```bash
 docker run \
-    --name dicedb-1 -p 6379:6379 -v $(pwd)/data:/data/ \
-    dicedb:latest \
+    --name dicedb-001 \
+    -p 6379:6379 -v $(pwd)/data:/data/ \
+    dicedb/dicedb \
     dicedb-server \
-    --protected-mode no \
-    --loadmodule /usr/local/lib/lib-spill.so path /data/spill/ max-memory 262144000 cleanup-interval 200
+      --port 6379 \
+      --maxmemory 500mb \
+      --protected-mode no \
+      --loadmodule /usr/local/lib/lib-spill.so path /data/spill/ max-memory 262144000
 ```
 
 ## Spill in Action
@@ -40,6 +44,13 @@ Once the DiceDB server is running with spill module loaded,
 run the following commands which - sets a key, evicts a key,
 and when we try to access it (via `GET`) it trasparently
 loads it in memory.
+
+```bash
+docker exec -it dicedb-001 dicedb-cli
+```
+
+We are explicitly eviciting the key using `EVICT` command, but in a production setup
+this might happen due to memory pressure
 
 ```
 SET k1 v1
@@ -52,7 +63,6 @@ GET k1
 
 - [Configuration Reference](docs/configuration.md)
 - [Commands Reference](docs/commands.md)
-
 
 ## Development
 
