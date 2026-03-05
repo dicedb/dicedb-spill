@@ -10,6 +10,10 @@ or manually using the [`EVICT` command](https://dicedb.io/commands/evict)), they
 moved to RocksDB. These keys remain logically accessible - any read operation
 restores them back to memory.
 
+### Per-Database Isolation
+
+The module maintains one RocksDB instance per DiceDB database. Keys evicted from `db0` are stored in `db0`'s spill store and restored only to `db0`. `FLUSHDB` wipes the spill store for that specific database; `FLUSHALL` wipes all of them. The spill store is also wiped clean every time the module loads, so there is no stale data from previous runs.
+
 ### Automatic Cleanup
 
 The module runs a background thread that periodically scans RocksDB to remove expired keys.
@@ -53,8 +57,8 @@ The spill metrics are split across two sections
 
 ### config section
 
-- `path` - Path to RocksDB storage directory
-- `max_memory_bytes` - Maximum memory budget for RocksDB in bytes
+- `path` - Base directory for RocksDB storage (subdirectories `db0`, `db1`, … are created per database)
+- `max_memory_bytes` - Total memory budget across all RocksDB instances in bytes
 - `cleanup_interval_seconds` - Interval between automatic cleanup runs in seconds
 
 Example:
@@ -129,7 +133,7 @@ v1
 SPILL.CLEANUP
 ```
 
-Manually scans the entire RocksDB database and removes all expired keys.
+Manually scans all RocksDB instances (one per database) and removes all expired keys.
 
 > This is a blocking operation that runs on the main DiceDB thread and may
 > stall other commands while executing. Use with caution in production environments.

@@ -7,7 +7,9 @@ Spill module persists evicted keys to RocksDB, expanding cache capacity onto dis
 - Automatically persists evicted keys to RocksDB
 - Transparently restores keys on cache misses
 - Fully preserves TTLs across evictions and restores
-- Supports configurable RocksDB storage with optional compression
+- One RocksDB instance per database — keys are isolated per DiceDB databases (db0, db1, …)
+- `FLUSHDB` clears only the affected database's spill store; `FLUSHALL` clears all
+- Starts fresh on every load — no stale data from previous runs
 - Adds minimal overhead with only 12 bytes of metadata per key
 - Automatically cleans up expired keys
 

@@ -14,11 +14,12 @@
 
 Required: Yes
 
-RocksDB data directory where evicted keys are persisted to disk.
+Base directory for RocksDB storage. The module creates one subdirectory per database (`db0`, `db1`, …) under this path. The number of subdirectories matches the server's `databases` config value (read automatically at load time).
 
 Example:
 ```bash
 --loadmodule ./modules/dicedb-spill/lib-spill.so path /tmp/data/spill
+# Creates /tmp/data/spill/db0, /tmp/data/spill/db1, … /tmp/data/spill/dbN
 ```
 
 ### `max-memory`
@@ -27,7 +28,7 @@ Example:
 - Default: 268435456 (256MB)
 - Minimum: 20971520 (20MB)
 
-Maximum memory budget allocated for RocksDB internal structures including block cache and write buffers. This controls the RAM footprint of the persistence layer.
+Total memory budget across all RocksDB instances. The budget is divided evenly per database (shared block cache + per-database write buffers). This controls the RAM footprint of the persistence layer.
 
 Example:
 ```bash
